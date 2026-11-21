@@ -1,0 +1,107 @@
+{
+  "name": "pw-locator-inspector",
+  "displayName": "Playwright Locator Inspector",
+  "description": "Embedded VS Code browser and live Playwright locator highlighting from code (Page Objects, helpers, and tests)",
+  "version": "0.8.5",
+  "author": "Rudoi S.",
+  "publisher": "RudoySergeyA",
+  "icon": "assets/icon.png",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/RudoySergeyA/pw-locator-inspector.git"
+  },
+  "homepage": "https://github.com/RudoySergeyA/pw-locator-inspector#readme",
+  "bugs": {
+    "url": "https://github.com/RudoySergeyA/pw-locator-inspector/issues"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Testing",
+    "Debuggers"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onCommand:pwLocatorInspector.openBrowser",
+    "onCommand:pwLocatorInspector.showLocator"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "pwLocatorInspector.openBrowser",
+        "title": "Playwright: Open Browser Inspector",
+        "icon": "$(globe)"
+      },
+      {
+        "command": "pwLocatorInspector.showLocator",
+        "title": "Show Locator in Browser",
+        "icon": "$(eye)"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "pwLocatorInspector.openBrowser",
+          "group": "navigation",
+          "when": "editorLangId == typescript || editorLangId == javascript || editorLangId == typescriptreact || editorLangId == javascriptreact"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "pwLocatorInspector.showLocator",
+          "group": "navigation@1",
+          "when": "editorLangId == typescript || editorLangId == javascript || editorLangId == typescriptreact || editorLangId == javascriptreact"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "pwLocatorInspector.showLocator",
+        "key": "ctrl+shift+l",
+        "mac": "cmd+shift+l",
+        "when": "editorTextFocus"
+      }
+    ],
+    "configuration": {
+      "title": "Playwright Locator Inspector",
+      "properties": {
+        "pwLocatorInspector.defaultUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Default URL when opening the embedded browser (falls back to baseURL from playwright.config)"
+        },
+        "pwLocatorInspector.viewportWidth": {
+          "type": "number",
+          "default": 1440,
+          "description": "Default viewport width of the embedded browser"
+        },
+        "pwLocatorInspector.viewportHeight": {
+          "type": "number",
+          "default": 900,
+          "description": "Default viewport height of the embedded browser"
+        },
+        "pwLocatorInspector.storageStatePath": {
+          "type": "string",
+          "default": "",
+          "description": "Relative or absolute path to a Playwright storageState (.json) file for authenticated sessions"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --target=node18 --sourcemap",
+    "typecheck": "tsc --noEmit",
+    "verify": "node scripts/verify.mjs",
+    "package": "npm run build && npx --yes @vscode/vsce package --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^3.2.1",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.7.2"
+  }
+}
