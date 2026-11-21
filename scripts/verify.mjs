@@ -105,6 +105,65 @@ assert.deepEqual(resolveLocatorAtPosition({
   filePath: loopFilePath, sourceText: loopSource, line: 7, column: 16,
 }).descriptor, loopDescriptor);
 
+const nullishSource = [
+  'const REVIEWS_CONSTANT = { defaultTitle: "Отзывы клиентов" };',
+  'class ReviewComponent {',
+  '  readonly page: Page;',
+  '  readonly reviewsConstant = REVIEWS_CONSTANT;',
+  '  readonly expectedTitle: string;',
+  '  readonly root: Locator;',
+  '  readonly title: Locator;',
+  '  readonly altRoot: Locator;',
+  '  constructor(page: Page, isMobile?: boolean, options?: { root?: Locator; title?: string }, fallbackRoot?: Locator) {',
+  '    this.page = page;',
+  '    this.expectedTitle = options?.title ?? this.reviewsConstant.defaultTitle;',
+  '    this.root = options?.root ?? this.page.locator("section", { hasText: this.expectedTitle });',
+  '    this.title = this.root.getByRole("heading", { level: 2 });',
+  '    this.altRoot = fallbackRoot || this.page.getByTestId(isMobile ? "m-root" : "d-root");',
+  '  }',
+  '}',
+].join('\n');
+const nullishFilePath = path.join(extensionRoot, 'reviewComponent.ts');
+const resolvedTitle = resolveLocatorAtPosition({
+  filePath: nullishFilePath, sourceText: nullishSource, line: 13, column: 20,
+});
+assert.deepEqual(resolvedTitle.descriptor?.steps, [
+  { method: 'locator', args: ['section', { hasText: 'Отзывы клиентов' }] },
+  { method: 'getByRole', args: ['heading', { level: 2 }] },
+]);
+const resolvedAltRoot = resolveLocatorAtPosition({
+  filePath: nullishFilePath, sourceText: nullishSource, line: 14, column: 20,
+});
+assert.deepEqual(resolvedAltRoot.descriptor?.steps, [
+  { method: 'getByTestId', args: ['d-root'] },
+]);
+const collectedNullish = collectFileLocators({
+  filePath: nullishFilePath, sourceText: nullishSource,
+});
+assert.equal(collectedNullish.length, 3);
+
+const subclassSource = [
+  nullishSource,
+  'class B2bReviewComponent extends ReviewComponent {',
+  '  constructor(page: Page, isMobile?: boolean) {',
+  '    super(page, isMobile, { root: page.getByTestId("b2b-reviews"), title: "Отзывы" });',
+  '  }',
+  '}',
+].join('\n');
+const resolvedWithSub = resolveLocatorAtPosition({
+  filePath: nullishFilePath, sourceText: subclassSource, line: 13, column: 20,
+});
+assert.equal(resolvedWithSub.requiresParameterSelection, true);
+assert.equal(resolvedWithSub.variantKind, 'context');
+assert.deepEqual(resolvedWithSub.parameterNames, ['Context']);
+assert.deepEqual(
+  resolvedWithSub.variants.map((v) => [v.id, v.descriptor.humanReadable]),
+  [
+    ['ReviewComponent', 'page.locator("section", { hasText: "Отзывы клиентов" }).getByRole("heading", { level: 2 })'],
+    ['B2bReviewComponent', 'page.getByTestId("b2b-reviews").getByRole("heading", { level: 2 })'],
+  ]
+);
+
 async function verifySelectionBadge(filePath, url) {
   const lines = ['page.locator(\'meta[name="description"]\')', 'page.getByRole("button", { name: "Mobile menu" })'];
   const start = { line: 0, character: 0 };
@@ -657,9 +716,14 @@ export class DemoPage {
       assert.equal(box.height, fileBox.height);
     }
     assert.ok(await fileButton.evaluate((button) => button.scrollWidth <= button.clientWidth));
+    assert.ok(await webviewPage.locator('#param-row').isVisible());
+    assert.ok(await webviewPage.locator('#param-select').isDisabled());
+    assert.equal(await webviewPage.locator('#param-custom-input').count(), 0);
+    assert.equal(await webviewPage.locator('#btn-param-apply').count(), 0);
     assert.ok(await webviewPage.locator('#locator-chain').isVisible());
     assert.ok(await webviewPage.locator('#elements-row').isVisible());
     assert.ok(await webviewPage.locator('#elements-select').isDisabled());
+    const chainEmptyHeight = (await webviewPage.locator('#locator-chain').boundingBox()).height;
     const loading = webviewPage.getByRole('progressbar', { name: 'Loading page' });
     assert.equal(await loading.isVisible(), false);
     const loadingUrl = `${baseUrl}/loading`;
@@ -722,11 +786,58 @@ export class DemoPage {
     }, goBorder, { timeout: 2000 });
     await options.last().click();
     assert.ok(await webviewPage.evaluate(() => window.__msgs.some((m) => m.type === 'focusElement' && m.index === 1)));
+    const chainLongBox = await webviewPage.locator('#locator-chain').boundingBox();
+    assert.ok(
+      await webviewPage.locator('#locator-chain').evaluate((el) => el.scrollWidth > el.clientWidth && el.classList.contains('has-horizontal-scroll')),
+      'Длинная цепочка Playwright должна включать расширенный режим при горизонтальном скролле'
+    );
+    assert.ok(chainLongBox.height > chainEmptyHeight, 'Поле Playwright должно увеличиваться по высоте при горизонтальном скролле');
+    const paramHighlight = {
+      ...hlSave,
+      humanReadable: 'page.getByText("0-4")',
+      parameterInfo: {
+        baseExpressionText: 'this.form.root.getByText(expectedMessage, { exact: true })',
+        parameterNames: ['expectedMessage'],
+        activeVariantId: 'v1',
+        variants: [
+          { id: 'v1', label: '0-4', parameters: { expectedMessage: '0-4' } },
+          { id: 'v2', label: '5-9', parameters: { expectedMessage: '5-9' } },
+          { id: 'v3', label: '10-14', parameters: { expectedMessage: '10-14' } },
+          { id: 'v4', label: '15-29', parameters: { expectedMessage: '15-29' } },
+          { id: 'v5', label: '30-39', parameters: { expectedMessage: '30-39' } },
+          { id: 'v6', label: '40-49', parameters: { expectedMessage: '40-49' } },
+        ],
+      },
+    };
+    await webviewPage.evaluate(({ highlight, url }) => {
+      window.postMessage({ type: 'state', payload: { pageReady: true, currentUrl: url, lastHighlight: highlight } }, '*');
+    }, { highlight: paramHighlight, url: baseUrl });
+    const paramButton = webviewPage.getByRole('button', { name: 'Parameter' });
+    await webviewPage.locator('#param-select:enabled').waitFor();
+    assert.equal(await webviewPage.locator('#param-value').textContent(), '"0-4"');
+    const paramRowBox = await webviewPage.locator('#param-row').boundingBox();
+    const paramButtonBox = await paramButton.boundingBox();
+    assert.ok(
+      paramButtonBox.x + paramButtonBox.width <= paramRowBox.x + paramRowBox.width + 1 && paramButtonBox.x + paramButtonBox.width <= 360,
+      'Dropdown параметров не должен выходить за пределы строки и экрана'
+    );
+    await paramButton.click();
+    const paramMenu = webviewPage.getByRole('listbox', { name: 'Parameter' });
+    assert.equal(await paramMenu.getByRole('option').count(), 6);
+    await paramMenu.getByRole('option', { name: '"5-9"' }).click();
+    assert.ok(await webviewPage.evaluate(() => window.__msgs.some((m) => m.type === 'selectParameterVariant' && m.variantId === 'v2')));
+    assert.equal(
+      await webviewPage.locator('#locator-chain').evaluate((el) => el.classList.contains('has-horizontal-scroll')),
+      false
+    );
     const details = webviewPage.locator('#inspector-details');
     const detailsBefore = await details.boundingBox();
     await webviewPage.locator('#btn-clear-highlight').click();
     assert.equal(await webviewPage.locator('#locator-chain').textContent(), '');
     assert.equal(await webviewPage.locator('#elements-value').textContent(), '');
+    assert.equal(await webviewPage.locator('#param-value').textContent(), '');
+    assert.ok(await webviewPage.locator('#param-row').isVisible());
+    assert.ok(await paramButton.isDisabled());
     assert.ok(await elementsButton.isDisabled());
     assert.deepEqual(await details.boundingBox(), detailsBefore);
     assert.equal(await webviewPage.locator('select').count(), 0);

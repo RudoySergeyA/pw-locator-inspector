@@ -8,9 +8,6 @@ import {
 
 export type SearchLocatorSnippetHandler = (snippet: string) => Promise<void>;
 export type SelectParameterVariantHandler = (variantId: string) => Promise<void>;
-export type ApplyCustomParameterHandler = (
-  overrides: Record<string, string | number | boolean>
-) => Promise<void>;
 
 export class BrowserWebviewPanel {
   public static readonly viewType = 'pwLocatorInspector.browserView';
@@ -50,7 +47,6 @@ export class BrowserWebviewPanel {
   }
   private onSearchLocatorSnippet?: SearchLocatorSnippetHandler;
   private onSelectParameterVariant?: SelectParameterVariantHandler;
-  private onApplyCustomParameter?: ApplyCustomParameterHandler;
 
   public static async createOrShow(
     context: vscode.ExtensionContext,
@@ -63,7 +59,6 @@ export class BrowserWebviewPanel {
       readEnvFiles?: boolean;
       onSearchLocatorSnippet?: SearchLocatorSnippetHandler;
       onSelectParameterVariant?: SelectParameterVariantHandler;
-      onApplyCustomParameter?: ApplyCustomParameterHandler;
     }
   ): Promise<BrowserWebviewPanel> {
     if (BrowserWebviewPanel.currentInstance) {
@@ -74,10 +69,6 @@ export class BrowserWebviewPanel {
       if (options?.onSelectParameterVariant) {
         BrowserWebviewPanel.currentInstance.onSelectParameterVariant =
           options.onSelectParameterVariant;
-      }
-      if (options?.onApplyCustomParameter) {
-        BrowserWebviewPanel.currentInstance.onApplyCustomParameter =
-          options.onApplyCustomParameter;
       }
       if (!BrowserWebviewPanel.currentInstance.panel.visible) {
         BrowserWebviewPanel.currentInstance.panel.reveal(
@@ -107,8 +98,7 @@ export class BrowserWebviewPanel {
       browserManager,
       context.workspaceState,
       options?.onSearchLocatorSnippet,
-      options?.onSelectParameterVariant,
-      options?.onApplyCustomParameter
+      options?.onSelectParameterVariant
     );
 
     await browserManager.ensureStarted(options);
@@ -124,15 +114,13 @@ export class BrowserWebviewPanel {
     browserManager: BrowserManager,
     workspaceState: vscode.Memento,
     onSearchLocatorSnippet?: SearchLocatorSnippetHandler,
-    onSelectParameterVariant?: SelectParameterVariantHandler,
-    onApplyCustomParameter?: ApplyCustomParameterHandler
+    onSelectParameterVariant?: SelectParameterVariantHandler
   ) {
     this.panel = panel;
     this.browserManager = browserManager;
     this.workspaceState = workspaceState;
     this.onSearchLocatorSnippet = onSearchLocatorSnippet;
     this.onSelectParameterVariant = onSelectParameterVariant;
-    this.onApplyCustomParameter = onApplyCustomParameter;
 
     this.panel.webview.html = this.getHtmlForWebview();
 
@@ -289,15 +277,6 @@ export class BrowserWebviewPanel {
             this.onSelectParameterVariant
           ) {
             await this.onSelectParameterVariant(msg.variantId);
-          }
-          break;
-        case 'applyCustomParameter':
-          if (
-            msg.overrides &&
-            typeof msg.overrides === 'object' &&
-            this.onApplyCustomParameter
-          ) {
-            await this.onApplyCustomParameter(msg.overrides);
           }
           break;
         case 'clearHighlight':
@@ -513,8 +492,7 @@ export class BrowserWebviewPanel {
       outline: none;
     }
     .url-input::placeholder,
-    .locator-search-input::placeholder,
-    .param-custom-input::placeholder {
+    .locator-search-input::placeholder {
       color: var(--input-placeholder);
     }
     .nav-group.is-new:has(.url-input:placeholder-shown) {
@@ -564,7 +542,8 @@ export class BrowserWebviewPanel {
       left: auto;
       right: 0;
     }
-    .elements-select-wrapper .select-popover {
+    .elements-select-wrapper .select-popover,
+    .param-select-wrapper .select-popover {
       position: fixed;
       z-index: 10;
       box-sizing: border-box;
@@ -587,17 +566,20 @@ export class BrowserWebviewPanel {
       background: var(--btn-hover-bg);
       border-color: var(--accent);
     }
-    #elements-options .select-option[aria-selected="true"] {
+    #elements-options .select-option[aria-selected="true"],
+    #param-options .select-option[aria-selected="true"] {
       border-color: var(--border-light);
     }
     .select-popover .select-option:hover,
     #elements-options .select-option:hover,
+    #param-options .select-option:hover,
     #history-entries .history-entry:hover {
       border-color: var(--primary-border);
       box-shadow: inset 0 0 0 1px var(--primary-border);
       transition: background 0.15s;
     }
-    #elements-options .select-option {
+    #elements-options .select-option,
+    #param-options .select-option {
       transition: background 0.15s;
     }
     .select-option:focus-visible {
@@ -659,10 +641,12 @@ export class BrowserWebviewPanel {
     .select-box:focus-visible {
       border-color: var(--accent);
     }
-    #elements-select:disabled {
+    #elements-select:disabled,
+    #param-select:disabled {
       cursor: default;
     }
-    #elements-select:disabled + .select-arrow {
+    #elements-select:disabled + .select-arrow,
+    #param-select:disabled + .select-arrow {
       visibility: hidden;
     }
     .select-arrow {
@@ -796,10 +780,11 @@ export class BrowserWebviewPanel {
     }
     .block-badge {
       flex: 0 0 88px;
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
+      width: 88px;
+      max-width: 88px;
+      display: block;
       height: 20px;
+      line-height: 18px;
       padding: 0 6px;
       border-radius: 4px;
       background: var(--panel-bg);
@@ -808,6 +793,10 @@ export class BrowserWebviewPanel {
       font-weight: 700;
       letter-spacing: 0.05em;
       text-transform: uppercase;
+      text-align: center;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
       color: var(--muted);
       user-select: none;
     }
@@ -824,9 +813,16 @@ export class BrowserWebviewPanel {
       scrollbar-width: thin;
     }
     .code-line.pw-chain {
-      height: 24px;
+      min-height: 24px;
+      line-height: 24px;
       overflow-y: hidden;
       color: var(--code-pw);
+    }
+    .code-line.pw-chain.has-horizontal-scroll {
+      min-height: 34px;
+      line-height: 1.5;
+      padding-top: 2px;
+      padding-bottom: 12px;
     }
 
     .param-toolbar,
@@ -836,68 +832,22 @@ export class BrowserWebviewPanel {
       gap: 6px;
       flex: 1;
       min-width: 0;
-      overflow: hidden;
-    }
-    #elements-row,
-    .elements-toolbar {
       overflow: visible;
     }
-    .chips-scroll-track {
-      display: flex;
-      align-items: center;
-      gap: 4px;
-      overflow-x: auto;
-      scrollbar-width: none;
-      max-width: 55%;
-      flex-shrink: 0;
+    #param-row,
+    #elements-row {
+      overflow: visible;
     }
-    .chips-scroll-track::-webkit-scrollbar {
-      display: none;
-    }
-    .nav-chip {
-      height: 22px;
-      padding: 0 8px;
-      border-radius: 4px;
-      background: var(--btn-bg);
-      border: 1px solid var(--border-light);
-      color: var(--btn-fg);
-      font-family: var(--vscode-editor-font-family, ui-monospace, SFMono-Regular, Menlo, monospace);
-      font-size: 11px;
-      font-weight: 600;
-      cursor: pointer;
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      white-space: nowrap;
-      flex-shrink: 0;
-      transition: background 0.12s, border-color 0.12s, color 0.12s;
-    }
-    .nav-chip:hover {
-      border-color: var(--accent);
-      background: var(--btn-hover-bg);
-    }
-    .nav-chip.active {
-      background: rgba(249, 115, 22, 0.22);
-      border-color: #f97316;
-      color: #fdba74;
-    }
-    .nav-chip.param-chip.active {
-      background: rgba(56, 189, 248, 0.2);
-      border-color: var(--accent);
-      color: var(--accent-link);
-    }
-    body.vscode-light .nav-chip.active,
-    body.vscode-high-contrast-light .nav-chip.active {
-      color: #c2410c;
-    }
-    .select-wrapper.elements-select-wrapper {
+    .select-wrapper.elements-select-wrapper,
+    .select-wrapper.param-select-wrapper {
       flex: 1 1 0%;
       width: 0;
       min-width: 0;
       max-width: 100%;
       display: flex;
     }
-    .select-box.elements-select {
+    .select-box.elements-select,
+    .select-box.param-select {
       width: 0;
       flex: 1 1 0%;
       min-width: 0;
@@ -907,28 +857,6 @@ export class BrowserWebviewPanel {
       font-family: var(--vscode-editor-font-family, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace);
       font-size: 11.5px;
       background: var(--card-bg);
-    }
-    .param-custom-group {
-      display: inline-flex;
-      align-items: center;
-      gap: 4px;
-      margin-left: auto;
-      flex-shrink: 0;
-    }
-    .param-custom-input {
-      height: 22px;
-      width: 150px;
-      background: var(--card-bg);
-      color: var(--input-fg);
-      border: 1px solid var(--border-light);
-      border-radius: 4px;
-      padding: 0 7px;
-      font-family: var(--vscode-editor-font-family, ui-monospace, SFMono-Regular, Menlo, monospace);
-      font-size: 11px;
-      outline: none;
-    }
-    .param-custom-input:focus {
-      border-color: var(--accent);
     }
 
     .viewport-host {
@@ -1046,9 +974,15 @@ export class BrowserWebviewPanel {
     </div>
 
     <div class="inspector-details" id="inspector-details">
-      <div class="inspector-block" id="param-row" style="display: none;">
-        <span class="block-badge" id="param-badge">Parameter</span>
-        <div class="param-toolbar" id="param-toolbar"></div>
+      <div class="inspector-block" id="param-row">
+        <span class="block-badge" id="param-badge" title="Parameter">Parameter</span>
+        <div class="param-toolbar" id="param-toolbar">
+          <div class="select-wrapper param-select-wrapper">
+            <button type="button" class="select-box param-select" id="param-select" disabled aria-label="Parameter" aria-haspopup="listbox" aria-expanded="false" aria-controls="param-options" aria-describedby="param-value"><span id="param-value"></span></button>
+            <span class="select-arrow" aria-hidden="true">▾</span>
+            <div class="select-popover" id="param-options" role="listbox" aria-label="Parameter" hidden></div>
+          </div>
+        </div>
       </div>
       <div class="inspector-block">
         <span class="block-badge">Playwright</span>
@@ -1097,9 +1031,8 @@ export class BrowserWebviewPanel {
     const locatorStatus = document.getElementById('locator-status');
     const pageSpinner = document.getElementById('page-spinner');
     const locatorChain = document.getElementById('locator-chain');
-    const paramRow = document.getElementById('param-row');
     const paramBadge = document.getElementById('param-badge');
-    const paramToolbar = document.getElementById('param-toolbar');
+    const paramButton = document.getElementById('param-select');
     const elementsButton = document.getElementById('elements-select');
 
     let viewportWidth = 1440;
@@ -1150,8 +1083,20 @@ export class BrowserWebviewPanel {
       locatorSearchInput.style.overflowY = scrollH > 110 ? 'auto' : 'hidden';
     }
 
+    function syncLocatorChainLayout() {
+      const hasOverflow =
+        Boolean(locatorChain.textContent) &&
+        locatorChain.scrollWidth > locatorChain.clientWidth + 1;
+      if (locatorChain.classList.contains('has-horizontal-scroll') !== hasOverflow) {
+        locatorChain.classList.toggle('has-horizontal-scroll', hasOverflow);
+      }
+    }
+
+    new ResizeObserver(syncLocatorChainLayout).observe(locatorChain);
+
     window.addEventListener('resize', () => {
       autoResizeLocatorInput();
+      syncLocatorChainLayout();
     });
 
     function resetInspectorPanel(clearSearchField = false) {
@@ -1159,8 +1104,8 @@ export class BrowserWebviewPanel {
       locatorStatus.className = 'badge badge-idle';
       btnClearHighlight.style.display = 'none';
       locatorChain.textContent = '';
-      paramToolbar.innerHTML = '';
-      paramRow.style.display = 'none';
+      syncLocatorChainLayout();
+      renderParameterBar(null);
       renderElements([], null);
       if (clearSearchField) {
         locatorSearchInput.value = '';
@@ -1337,8 +1282,10 @@ export class BrowserWebviewPanel {
         }
       }
 
+      const isFixedPopover = trigger.id === 'elements-select' || trigger.id === 'param-select';
+
       function positionPopover() {
-        if (trigger.id !== 'elements-select' || listbox.hidden) return;
+        if (!isFixedPopover || listbox.hidden) return;
         const rect = trigger.getBoundingClientRect();
         const top = rect.bottom + 4;
         listbox.style.top = top + 'px';
@@ -1409,7 +1356,7 @@ export class BrowserWebviewPanel {
       }
 
       const control = { wrapper, close, update };
-      if (trigger.id === 'elements-select') {
+      if (isFixedPopover) {
         new ResizeObserver(positionPopover).observe(trigger);
         window.addEventListener('resize', positionPopover);
       }
@@ -1467,6 +1414,10 @@ export class BrowserWebviewPanel {
       }
     });
     viewportSelect.update(viewportOptions, '1440x900');
+
+    const paramSelect = createSelect('param-select', (variantId) => {
+      vscode.postMessage({ type: 'selectParameterVariant', variantId });
+    });
 
     const elementsSelect = createSelect('elements-select', (value) => {
       vscode.postMessage({ type: 'focusElement', index: value === '' ? null : Number(value) });
@@ -1552,77 +1503,41 @@ export class BrowserWebviewPanel {
     }
 
     function renderParameterBar(paramInfo) {
-      paramToolbar.innerHTML = '';
       if (!paramInfo || !Array.isArray(paramInfo.parameterNames) || paramInfo.parameterNames.length === 0) {
-        paramRow.style.display = 'none';
+        paramBadge.textContent = 'Parameter';
+        paramBadge.title = 'Parameter';
+        paramButton.disabled = true;
+        paramSelect.close();
+        paramSelect.update([], '');
         return;
       }
-      paramRow.style.display = 'flex';
-      paramBadge.textContent =
+
+      const badgeLabel =
         paramInfo.parameterNames.length === 1
           ? paramInfo.parameterNames[0]
           : 'Parameters';
-
-      const track = document.createElement('div');
-      track.className = 'chips-scroll-track';
-      track.style.maxWidth = '68%';
+      paramBadge.textContent = badgeLabel;
+      paramBadge.title = paramInfo.parameterNames.join(', ');
 
       const variants = paramInfo.variants || [];
-      variants.forEach((v) => {
-        const btn = document.createElement('button');
-        btn.className =
-          'nav-chip param-chip' + (paramInfo.activeVariantId === v.id ? ' active' : '');
-        const paramVals = Object.values(v.parameters || {})
-          .map((val) => JSON.stringify(val))
-          .join(', ');
-        btn.textContent = paramVals || v.label;
-        btn.title = v.label + (v.description ? ' -> ' + v.description : '');
-        btn.addEventListener('click', () => {
-          vscode.postMessage({
-            type: 'selectParameterVariant',
-            variantId: v.id,
-          });
+      if (variants.length > 0) {
+        const options = variants.map((v) => {
+          const paramVals = Object.values(v.parameters || {})
+            .map((val) => JSON.stringify(val))
+            .join(', ');
+          return {
+            value: v.id,
+            label: paramVals || v.label,
+            title: v.label + (v.description ? ' -> ' + v.description : ''),
+          };
         });
-        track.appendChild(btn);
-      });
-      paramToolbar.appendChild(track);
-
-      const customGroup = document.createElement('div');
-      customGroup.className = 'param-custom-group';
-      const firstParam = paramInfo.parameterNames[0];
-      const input = document.createElement('input');
-      input.type = 'text';
-      input.className = 'param-custom-input';
-      input.placeholder = 'Custom value (' + firstParam + ')...';
-      if (paramInfo.customValues && paramInfo.customValues[firstParam] !== undefined) {
-        input.value = String(paramInfo.customValues[firstParam]);
+        paramButton.disabled = false;
+        paramSelect.update(options, paramInfo.activeVariantId || '');
+      } else {
+        paramButton.disabled = true;
+        paramSelect.close();
+        paramSelect.update([], '');
       }
-      const applyBtn = document.createElement('button');
-      applyBtn.className = 'nav-chip';
-      applyBtn.textContent = 'Apply';
-      applyBtn.title = 'Apply custom parameter value';
-      const submitCustom = () => {
-        const raw = input.value.trim();
-        if (!raw) return;
-        const overrides = {};
-        paramInfo.parameterNames.forEach((pName) => {
-          overrides[pName] = raw;
-        });
-        vscode.postMessage({
-          type: 'applyCustomParameter',
-          overrides,
-        });
-      };
-      applyBtn.addEventListener('click', submitCustom);
-      input.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') {
-          e.preventDefault();
-          submitCustom();
-        }
-      });
-      customGroup.appendChild(input);
-      customGroup.appendChild(applyBtn);
-      paramToolbar.appendChild(customGroup);
     }
 
     function renderHighlight(hl) {
@@ -1641,6 +1556,7 @@ export class BrowserWebviewPanel {
       locatorStatus.className = 'badge ' + (hl.count > 0 ? 'badge-ok' : 'badge-zero');
       btnClearHighlight.style.display = 'inline-flex';
       locatorChain.textContent = hl.humanReadable;
+      syncLocatorChainLayout();
       autoResizeLocatorInput();
 
       renderParameterBar(hl.parameterInfo);

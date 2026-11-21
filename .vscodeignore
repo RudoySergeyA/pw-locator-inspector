@@ -7,6 +7,7 @@ tsconfig.json
 *.ts
 *.map
 dist/*.map
+dist/core-test-bundle.cjs
 *.vsix
 .gitignore
 PLAN.md

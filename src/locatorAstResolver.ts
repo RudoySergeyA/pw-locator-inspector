@@ -121,7 +121,9 @@ export interface ResolvedLocatorResult {
   requiresParameterSelection: boolean;
   /** Список имён параметров, от которых зависит локатор */
   parameterNames: string[];
-  /** Готовые варианты (из вызовов хелпера в классе или из массивов констант) */
+  /** Тип вариантов: параметры метода/хелпера или контексты классов-наследников */
+  variantKind?: 'parameter' | 'context';
+  /** Готовые варианты (из вызовов хелпера в классе, из массивов констант или из super() наследников) */
   variants: LocatorVariant[];
 }
 
@@ -792,10 +794,33 @@ class ModuleAstLoader {
       return undefined;
     }
     if (ts.isBinaryExpression(target)) {
+      const op = target.operatorToken.kind;
+      if (op === ts.SyntaxKind.QuestionQuestionToken) {
+        const left = this.evalStaticExpression(target.left, env);
+        if (
+          left &&
+          !(
+            left.kind === 'primitive' &&
+            (left.value === null || left.value === undefined)
+          )
+        ) {
+          return left;
+        }
+        return this.evalStaticExpression(target.right, env);
+      }
+      if (op === ts.SyntaxKind.BarBarToken) {
+        const left = this.evalStaticExpression(target.left, env);
+        const isTruthy =
+          left?.kind === 'primitive' ? Boolean(left.value) : Boolean(left);
+        if (isTruthy) {
+          return left;
+        }
+        return this.evalStaticExpression(target.right, env);
+      }
       const left = this.evalStaticExpression(target.left, env);
       const right = this.evalStaticExpression(target.right, env);
       if (
-        target.operatorToken.kind === ts.SyntaxKind.PlusToken &&
+        op === ts.SyntaxKind.PlusToken &&
         left?.kind === 'primitive' &&
         right?.kind === 'primitive'
       ) {
@@ -986,6 +1011,93 @@ function findClassFileInProject(startFile: string, className: string): string | 
   return undefined;
 }
 
+function escapeRegExpForScan(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Находит файлы в проекте, содержащие подклассы `extends <baseClassName>`.
+ */
+function findSubclassFilesInProject(
+  startFile: string,
+  baseClassName: string
+): string[] {
+  const projectRoot = findProjectRootFromFile(startFile);
+  const searchRoots = [
+    path.join(projectRoot, 'src', 'pages'),
+    path.join(projectRoot, 'src', 'components'),
+    path.join(projectRoot, 'src'),
+    path.join(projectRoot, 'pages'),
+    path.dirname(path.resolve(startFile)),
+  ];
+  const extendsRegex = new RegExp(`\\bextends\\s+${escapeRegExpForScan(baseClassName)}\\b`);
+  const visitedDirs = new Set<string>();
+  const visitedFiles = new Set<string>();
+  const matches: string[] = [];
+
+  const walk = (dir: string, depth: number): void => {
+    if (depth > 5 || matches.length >= 20) {
+      return;
+    }
+    const resolvedDir = path.resolve(dir);
+    if (visitedDirs.has(resolvedDir) || !fs.existsSync(resolvedDir)) {
+      return;
+    }
+    visitedDirs.add(resolvedDir);
+    let entries: fs.Dirent[] = [];
+    try {
+      entries = fs.readdirSync(resolvedDir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (matches.length >= 20) {
+        return;
+      }
+      const full = path.join(resolvedDir, entry.name);
+      if (entry.isDirectory()) {
+        if (
+          entry.name !== 'node_modules' &&
+          entry.name !== 'dist' &&
+          entry.name !== 'build' &&
+          !entry.name.startsWith('.')
+        ) {
+          walk(full, depth + 1);
+        }
+        continue;
+      }
+      if (
+        !entry.isFile() ||
+        entry.name.endsWith('.d.ts') ||
+        !/\.(ts|tsx|js|jsx)$/.test(entry.name)
+      ) {
+        continue;
+      }
+      if (visitedFiles.has(full)) {
+        continue;
+      }
+      visitedFiles.add(full);
+      try {
+        const stat = fs.statSync(full);
+        if (stat.size > 512 * 1024) {
+          continue;
+        }
+        const content = fs.readFileSync(full, 'utf8');
+        if (extendsRegex.test(content)) {
+          matches.push(full);
+        }
+      } catch {
+        // ignore unreadable files
+      }
+    }
+  };
+
+  for (const root of searchRoots) {
+    walk(root, 0);
+  }
+  return matches;
+}
+
 /**
  * Находит файл констант в проекте по имени идентификатора (например, BaseConstant -> Base.constant.ts).
  */
@@ -1050,6 +1162,13 @@ function findConstantFileInProject(startFile: string, symbolName: string): strin
   return undefined;
 }
 
+interface SubclassInstanceVariant {
+  className: string;
+  instance: AstValue & { kind: 'classInstance' };
+  ctorEnv?: ScopeEnv;
+  nodeEnvs: Map<ts.Node, ScopeEnv>;
+}
+
 class FileLocatorAnalyzer {
   private readonly sf: ts.SourceFile;
   private readonly filePath: string;
@@ -1058,6 +1177,7 @@ class FileLocatorAnalyzer {
   private readonly functionCalls = new Map<ts.Node, FunctionCallRecord[]>();
   private readonly classInstances = new Map<ts.ClassDeclaration, AstValue & { kind: 'classInstance' }>();
   private readonly nodeEnvs = new Map<ts.Node, ScopeEnv>();
+  private readonly subclassVariantsCache = new Map<ts.ClassDeclaration, SubclassInstanceVariant[]>();
   private readonly visitedClassFiles: Set<string>;
 
   constructor(
@@ -1089,6 +1209,315 @@ class FileLocatorAnalyzer {
       return inst;
     }
     return undefined;
+  }
+
+  public getPrimaryClassDeclaration(): ts.ClassDeclaration | undefined {
+    for (const decl of this.classInstances.keys()) {
+      return decl;
+    }
+    return undefined;
+  }
+
+  public findEnclosingClassDeclaration(node: ts.Node): ts.ClassDeclaration | undefined {
+    let cur: ts.Node | undefined = node;
+    while (cur) {
+      if (ts.isClassDeclaration(cur) && this.classInstances.has(cur)) {
+        return cur;
+      }
+      cur = cur.parent;
+    }
+    return undefined;
+  }
+
+  public collectSuperCallsForBaseClass(
+    baseClassName: string
+  ): Array<{ className: string; superArgs: Array<AstValue | undefined> }> {
+    const results: Array<{ className: string; superArgs: Array<AstValue | undefined> }> = [];
+    for (const stmt of this.sf.statements) {
+      if (!ts.isClassDeclaration(stmt) || !stmt.name || !stmt.heritageClauses) {
+        continue;
+      }
+      const extendsBase = stmt.heritageClauses.some(
+        (clause) =>
+          clause.token === ts.SyntaxKind.ExtendsKeyword &&
+          clause.types.some((heritageType) => {
+            const expr = unwrapParensAndTypes(heritageType.expression);
+            return ts.isIdentifier(expr) && expr.text === baseClassName;
+          })
+      );
+      if (!extendsBase) {
+        continue;
+      }
+      const subCtor = stmt.members.find(
+        (m): m is ts.ConstructorDeclaration =>
+          ts.isConstructorDeclaration(m) && Boolean(m.body)
+      );
+      if (!subCtor || !subCtor.body) {
+        continue;
+      }
+      const subCtorEnv =
+        this.nodeEnvs.get(subCtor) || this.classInstances.get(stmt)?.ctorEnv;
+      if (!subCtorEnv) {
+        continue;
+      }
+      let superCall: ts.CallExpression | undefined;
+      const findSuper = (n: ts.Node): void => {
+        if (superCall) {
+          return;
+        }
+        if (
+          ts.isCallExpression(n) &&
+          n.expression.kind === ts.SyntaxKind.SuperKeyword
+        ) {
+          superCall = n;
+          return;
+        }
+        if (
+          ts.isFunctionDeclaration(n) ||
+          ts.isFunctionExpression(n) ||
+          ts.isArrowFunction(n) ||
+          ts.isClassExpression(n)
+        ) {
+          return;
+        }
+        ts.forEachChild(n, findSuper);
+      };
+      findSuper(subCtor.body);
+      if (!superCall) {
+        continue;
+      }
+      const superArgs = superCall.arguments.map((arg) =>
+        this.evaluateNode(arg, subCtorEnv, new Set())
+      );
+      results.push({
+        className: stmt.name.text,
+        superArgs,
+      });
+    }
+    return results;
+  }
+
+  private buildClassInstanceWithCtorArgs(
+    classDecl: ts.ClassDeclaration,
+    ctorArgOverrides: Array<AstValue | undefined>
+  ): SubclassInstanceVariant {
+    const className = classDecl.name?.text || 'AnonymousClass';
+    const classEnv = createEnv(this.rootEnv);
+    const props = new Map<string, AstValue>();
+    const methods = new Map<string, ts.MethodDeclaration>();
+    const variantNodeEnvs = new Map<ts.Node, ScopeEnv>();
+
+    props.set('page', { kind: 'page' });
+
+    const instance: AstValue & { kind: 'classInstance' } = {
+      kind: 'classInstance',
+      className,
+      props,
+      methods,
+      classEnv,
+    };
+
+    classEnv.vars.set('this', instance);
+
+    for (const member of classDecl.members) {
+      if (ts.isMethodDeclaration(member) && member.name) {
+        const mName =
+          ts.isIdentifier(member.name) || ts.isStringLiteral(member.name)
+            ? member.name.text
+            : undefined;
+        if (mName) {
+          methods.set(mName, member);
+        }
+      }
+    }
+
+    for (const member of classDecl.members) {
+      if (ts.isPropertyDeclaration(member) && member.initializer) {
+        const pName =
+          ts.isIdentifier(member.name) || ts.isStringLiteral(member.name)
+            ? member.name.text
+            : undefined;
+        variantNodeEnvs.set(member, classEnv);
+        if (pName) {
+          const val = this.evaluateNode(member.initializer, classEnv, new Set());
+          if (val) {
+            props.set(pName, val);
+          }
+        }
+      }
+    }
+
+    let ctorEnvResult: ScopeEnv | undefined;
+    for (const member of classDecl.members) {
+      if (ts.isConstructorDeclaration(member) && member.body) {
+        const ctorEnv = createEnv(classEnv);
+        ctorEnv.vars.set('this', instance);
+        member.parameters.forEach((param, idx) => {
+          if (ts.isIdentifier(param.name)) {
+            const overrideVal = ctorArgOverrides[idx];
+            if (overrideVal !== undefined) {
+              ctorEnv.vars.set(param.name.text, overrideVal);
+            } else if (param.name.text === 'page') {
+              ctorEnv.vars.set('page', { kind: 'page' });
+            } else if (param.initializer) {
+              const defVal = this.evaluateNode(param.initializer, ctorEnv, new Set());
+              if (defVal) {
+                ctorEnv.vars.set(param.name.text, defVal);
+              }
+            } else {
+              const isBooleanParam =
+                param.type?.kind === ts.SyntaxKind.BooleanKeyword ||
+                /^is[A-Z]/.test(param.name.text);
+              ctorEnv.vars.set(param.name.text, {
+                kind: 'primitive',
+                value: isBooleanParam ? false : undefined,
+              });
+            }
+          }
+        });
+        variantNodeEnvs.set(member, ctorEnv);
+        this.executeStatementBlock(
+          member.body.statements,
+          ctorEnv,
+          instance,
+          variantNodeEnvs
+        );
+        ctorEnvResult = cloneEnv(ctorEnv);
+        instance.ctorEnv = ctorEnvResult;
+      }
+    }
+
+    return {
+      className,
+      instance,
+      ctorEnv: ctorEnvResult,
+      nodeEnvs: variantNodeEnvs,
+    };
+  }
+
+  private getSubclassVariantsForClass(
+    classDecl: ts.ClassDeclaration
+  ): SubclassInstanceVariant[] {
+    const cached = this.subclassVariantsCache.get(classDecl);
+    if (cached) {
+      return cached;
+    }
+    const baseClassName = classDecl.name?.text;
+    const baseCtor = classDecl.members.find(
+      (m): m is ts.ConstructorDeclaration =>
+        ts.isConstructorDeclaration(m) && Boolean(m.body)
+    );
+    if (!baseClassName || !baseCtor || baseCtor.parameters.length <= 1) {
+      this.subclassVariantsCache.set(classDecl, []);
+      return [];
+    }
+
+    const superCalls: Array<{
+      className: string;
+      superArgs: Array<AstValue | undefined>;
+    }> = [...this.collectSuperCallsForBaseClass(baseClassName)];
+
+    const candidateFiles = findSubclassFilesInProject(
+      this.filePath,
+      baseClassName
+    );
+    for (const subFile of candidateFiles) {
+      const resolvedSub = path.resolve(subFile);
+      if (resolvedSub === this.filePath || this.visitedClassFiles.has(resolvedSub)) {
+        continue;
+      }
+      try {
+        const subText = fs.readFileSync(resolvedSub, 'utf8');
+        const subAnalyzer = new FileLocatorAnalyzer(
+          resolvedSub,
+          subText,
+          new Set(this.visitedClassFiles),
+          this.loader
+        );
+        superCalls.push(...subAnalyzer.collectSuperCallsForBaseClass(baseClassName));
+      } catch {
+        // ignore unparseable subclass files
+      }
+    }
+
+    const variants: SubclassInstanceVariant[] = [];
+    for (const call of superCalls) {
+      if (call.superArgs.length <= 1) {
+        continue;
+      }
+      const built = this.buildClassInstanceWithCtorArgs(classDecl, call.superArgs);
+      variants.push({
+        ...built,
+        className: call.className,
+      });
+    }
+
+    this.subclassVariantsCache.set(classDecl, variants);
+    return variants;
+  }
+
+  public buildSubclassLocatorVariants(
+    locatorExprNode: ts.Node,
+    baseDescriptor: LocatorDescriptor,
+    baseScope: ScopeEnv,
+    explicitClassDecl?: ts.ClassDeclaration
+  ): LocatorVariant[] {
+    const classDecl =
+      explicitClassDecl || this.findEnclosingClassDeclaration(locatorExprNode);
+    if (!classDecl) {
+      return [];
+    }
+    const subVariants = this.getSubclassVariantsForClass(classDecl);
+    if (subVariants.length === 0) {
+      return [];
+    }
+    const baseClassName = classDecl.name?.text || 'Default';
+    const seenHuman = new Set<string>([baseDescriptor.humanReadable]);
+    const extraVariants: LocatorVariant[] = [];
+
+    for (const sv of subVariants) {
+      let variantScope: ScopeEnv | undefined;
+      let cur: ts.Node | undefined = locatorExprNode;
+      while (cur) {
+        const found = sv.nodeEnvs.get(cur);
+        if (found) {
+          variantScope = cloneEnv(found);
+          break;
+        }
+        cur = cur.parent;
+      }
+      if (!variantScope) {
+        variantScope = cloneEnv(baseScope);
+      }
+      variantScope.vars.set('this', sv.instance);
+
+      const vEval = this.evaluateNode(locatorExprNode, variantScope, new Set());
+      if (vEval?.kind === 'locator' && !seenHuman.has(vEval.descriptor.humanReadable)) {
+        seenHuman.add(vEval.descriptor.humanReadable);
+        extraVariants.push({
+          id: sv.className,
+          label: sv.className,
+          description: vEval.descriptor.humanReadable,
+          parameters: {},
+          descriptor: vEval.descriptor,
+        });
+      }
+    }
+
+    if (extraVariants.length === 0) {
+      return [];
+    }
+
+    return [
+      {
+        id: baseClassName,
+        label: `${baseClassName} (default)`,
+        description: baseDescriptor.humanReadable,
+        parameters: {},
+        descriptor: baseDescriptor,
+      },
+      ...extraVariants,
+    ];
   }
 
   public getClassInstanceByName(
@@ -1193,10 +1622,14 @@ class FileLocatorAnalyzer {
                 ctorEnv.vars.set(param.name.text, defVal);
               }
             } else {
-              // Для опциональных параметров конструктора (например, isMobile?: boolean) задаём false по умолчанию
+              // Для boolean-параметров (например, isMobile?: boolean) задаём false,
+              // для остальных опциональных (options?, root?) — undefined, чтобы срабатывал `??`
+              const isBooleanParam =
+                param.type?.kind === ts.SyntaxKind.BooleanKeyword ||
+                /^is[A-Z]/.test(param.name.text);
               ctorEnv.vars.set(param.name.text, {
                 kind: 'primitive',
-                value: false,
+                value: isBooleanParam ? false : undefined,
               });
             }
           }
@@ -1229,14 +1662,15 @@ class FileLocatorAnalyzer {
   private executeStatementBlock(
     statements: readonly ts.Statement[],
     env: ScopeEnv,
-    instance: AstValue & { kind: 'classInstance' }
+    instance: AstValue & { kind: 'classInstance' },
+    targetNodeEnvs: Map<ts.Node, ScopeEnv> = this.nodeEnvs
   ): void {
     for (const stmt of statements) {
-      this.nodeEnvs.set(stmt, cloneEnv(env));
+      targetNodeEnvs.set(stmt, cloneEnv(env));
 
       if (ts.isVariableStatement(stmt)) {
         for (const decl of stmt.declarationList.declarations) {
-          this.nodeEnvs.set(decl, cloneEnv(env));
+          targetNodeEnvs.set(decl, cloneEnv(env));
           if (ts.isIdentifier(decl.name) && decl.initializer) {
             const varName = decl.name.text;
             const val = this.evaluateNode(
@@ -1454,11 +1888,50 @@ class FileLocatorAnalyzer {
       return undefined;
     }
 
-    if (
-      ts.isBinaryExpression(node) &&
-      node.operatorToken.kind === ts.SyntaxKind.EqualsToken
-    ) {
-      return this.evaluateNode(node.right, env, unresolvedParams, contextLabel);
+    if (ts.isBinaryExpression(node)) {
+      const op = node.operatorToken.kind;
+      if (op === ts.SyntaxKind.EqualsToken) {
+        return this.evaluateNode(node.right, env, unresolvedParams, contextLabel);
+      }
+      if (op === ts.SyntaxKind.QuestionQuestionToken) {
+        const leftUnresolved =
+          unresolvedParams instanceof LoopEvaluation
+            ? new LoopEvaluation()
+            : new Set<string>();
+        const left = this.evaluateNode(node.left, env, leftUnresolved, contextLabel);
+        const hasConcreteLeft =
+          left !== undefined &&
+          left.kind !== 'unresolvedParam' &&
+          !(
+            left.kind === 'primitive' &&
+            (left.value === null || left.value === undefined)
+          );
+        if (hasConcreteLeft) {
+          for (const p of leftUnresolved) {
+            unresolvedParams.add(p);
+          }
+          return left;
+        }
+        return this.evaluateNode(node.right, env, unresolvedParams, contextLabel);
+      }
+      if (op === ts.SyntaxKind.BarBarToken) {
+        const leftUnresolved =
+          unresolvedParams instanceof LoopEvaluation
+            ? new LoopEvaluation()
+            : new Set<string>();
+        const left = this.evaluateNode(node.left, env, leftUnresolved, contextLabel);
+        const isTruthy =
+          left !== undefined &&
+          left.kind !== 'unresolvedParam' &&
+          (left.kind === 'primitive' ? Boolean(left.value) : true);
+        if (isTruthy) {
+          for (const p of leftUnresolved) {
+            unresolvedParams.add(p);
+          }
+          return left;
+        }
+        return this.evaluateNode(node.right, env, unresolvedParams, contextLabel);
+      }
     }
 
     if (
@@ -2814,8 +3287,26 @@ function buildResultFromCandidate(
     throw new Error(`Failed to resolve locator for expression: ${expressionText}`);
   }
 
-  // Если свободных параметров нет — сразу возвращаем готовый дескриптор
+  // Если свободных параметров нет — проверяем, есть ли варианты из super(...) наследников
   if (unresolvedParams.size === 0) {
+    const subclassVariants = analyzer.buildSubclassLocatorVariants(
+      candidate.locatorExprNode,
+      evalResult.descriptor,
+      baseScope
+    );
+    if (subclassVariants.length > 1) {
+      return {
+        expressionText,
+        range,
+        activeLineRanges,
+        strippedActionMethod: candidate.strippedActionMethod,
+        descriptor: evalResult.descriptor,
+        requiresParameterSelection: true,
+        parameterNames: ['Context'],
+        variantKind: 'context',
+        variants: subclassVariants,
+      };
+    }
     return {
       expressionText,
       range,
@@ -3371,6 +3862,24 @@ function tryResolveSnippetWithAnalyzer(
     };
 
     if (unresolvedParams.size === 0) {
+      const subclassVariants = analyzer.buildSubclassLocatorVariants(
+        cand.locatorExprNode,
+        val.descriptor,
+        evalEnv,
+        analyzer.getPrimaryClassDeclaration()
+      );
+      if (subclassVariants.length > 1) {
+        return {
+          expressionText,
+          range,
+          strippedActionMethod: cand.strippedActionMethod,
+          descriptor: val.descriptor,
+          requiresParameterSelection: true,
+          parameterNames: ['Context'],
+          variantKind: 'context',
+          variants: subclassVariants,
+        };
+      }
       return {
         expressionText,
         range,
@@ -3747,6 +4256,7 @@ export interface CollectedFileLocator {
   expressionText: string;
   descriptor?: LocatorDescriptor;
   requiresParameterSelection: boolean;
+  variantKind?: 'parameter' | 'context';
   variants: LocatorVariant[];
 }
 
@@ -3956,6 +4466,7 @@ export function collectFileLocators(options: {
         expressionText: resolved.expressionText,
         descriptor: resolved.descriptor,
         requiresParameterSelection: resolved.requiresParameterSelection,
+        variantKind: resolved.variantKind,
         variants: resolved.variants,
       });
     } catch {

@@ -43,7 +43,6 @@ export interface HighlightParameterInfo {
   baseExpressionText: string;
   parameterNames: string[];
   activeVariantId?: string;
-  customValues?: Record<string, unknown>;
   variants: HighlightParameterVariantInfo[];
 }
 

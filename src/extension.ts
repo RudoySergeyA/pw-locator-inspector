@@ -333,7 +333,60 @@ export function activate(context: vscode.ExtensionContext): void {
         const highlightLink = `[Highlight in browser](command:pwLocatorInspector.showLocatorAtPosition?${cmdArgs})`;
 
         try {
-          if (item.requiresParameterSelection && item.variants.length > 0) {
+          if (
+            item.requiresParameterSelection &&
+            item.variants.length > 0 &&
+            item.variantKind === 'context'
+          ) {
+            let matchedVariant = item.variants[0];
+            let matchedProbe: { browserReady: boolean; count: number; visibleCount: number } = {
+              browserReady: true,
+              count: 0,
+              visibleCount: 0,
+            };
+            for (const variant of item.variants) {
+              if (epoch !== gutterScanEpoch || !BrowserWebviewPanel.isOpen()) {
+                return;
+              }
+              const probe = await browserManager.probeLocatorCount(
+                variant.descriptor
+              );
+              if (!probe.browserReady) {
+                return;
+              }
+              if (probe.count > 0) {
+                matchedVariant = variant;
+                matchedProbe = probe;
+                break;
+              }
+            }
+            if (epoch !== gutterScanEpoch || !BrowserWebviewPanel.isOpen()) {
+              return;
+            }
+            const kind: GutterBadgeKind =
+              matchedProbe.count === 0
+                ? 'zero'
+                : matchedProbe.count === 1
+                  ? 'ok'
+                  : 'multi';
+            const label = formatGutterCountLabel(matchedProbe.count);
+            const decType = getGutterDecorationType(kind, label);
+            const statusLine =
+              matchedProbe.count === 0
+                ? '**Not found in DOM** (`0` matches)'
+                : matchedProbe.count === 1
+                  ? `**Found: 1** (visible: ${matchedProbe.visibleCount}) · \`${matchedVariant.label}\``
+                  : `**Found: ${matchedProbe.count}** (visible: ${matchedProbe.visibleCount}) — multiple matches · \`${matchedVariant.label}\``;
+            const md = new vscode.MarkdownString(
+              `${statusLine}\n\n` +
+                `\`\`\`ts\n${matchedVariant.descriptor.humanReadable}\n\`\`\`\n` +
+                highlightLink
+            );
+            md.isTrusted = true;
+            const bucket = grouped.get(decType) || [];
+            bucket.push({ range, hoverMessage: md });
+            grouped.set(decType, bucket);
+          } else if (item.requiresParameterSelection && item.variants.length > 0) {
             let matchedVariants = 0;
             for (const variant of item.variants) {
               if (epoch !== gutterScanEpoch || !BrowserWebviewPanel.isOpen()) {
@@ -484,16 +537,16 @@ export function activate(context: vscode.ExtensionContext): void {
 
   let currentParameterizedSession: ParameterizedSession | undefined;
 
-  const buildInitialHighlightPayload = (
+  const buildInitialHighlightPayload = async (
     resolved: ResolvedLocatorResult,
     reResolveWithOverrides: (
       overrides: Record<string, SerializedArg>
     ) => ResolvedLocatorResult
-  ): {
+  ): Promise<{
     descriptor?: LocatorDescriptor;
     expressionLabel: string;
     parameterInfo?: HighlightParameterInfo;
-  } => {
+  }> => {
     if (!resolved.requiresParameterSelection) {
       currentParameterizedSession = undefined;
       return {
@@ -507,11 +560,27 @@ export function activate(context: vscode.ExtensionContext): void {
       reResolveWithOverrides,
     };
 
-    const firstVariant = resolved.variants[0];
+    let chosenVariant = resolved.variants[0];
+    if (
+      resolved.variants.length > 1 &&
+      browserManager?.getStateSnapshot().pageReady
+    ) {
+      for (const variant of resolved.variants) {
+        const probe = await browserManager.probeLocatorCount(variant.descriptor);
+        if (!probe.browserReady) {
+          break;
+        }
+        if (probe.count > 0) {
+          chosenVariant = variant;
+          break;
+        }
+      }
+    }
+
     const parameterInfo: HighlightParameterInfo = {
       baseExpressionText: resolved.expressionText,
       parameterNames: resolved.parameterNames,
-      activeVariantId: firstVariant?.id,
+      activeVariantId: chosenVariant?.id,
       variants: resolved.variants.map((v) => ({
         id: v.id,
         label: v.label,
@@ -521,9 +590,9 @@ export function activate(context: vscode.ExtensionContext): void {
       })),
     };
 
-    if (firstVariant) {
+    if (chosenVariant) {
       return {
-        descriptor: firstVariant.descriptor,
+        descriptor: chosenVariant.descriptor,
         expressionLabel: resolved.expressionText,
         parameterInfo,
       };
@@ -553,9 +622,6 @@ export function activate(context: vscode.ExtensionContext): void {
 
   let handleSearchLocatorSnippet: (snippet: string) => Promise<void>;
   let handleSelectParameterVariant: (variantId: string) => Promise<void>;
-  let handleApplyCustomParameter: (
-    overrides: Record<string, string | number | boolean>
-  ) => Promise<void>;
 
   const getWorkspaceOptions = () => {
     const editor = vscode.window.activeTextEditor;
@@ -588,9 +654,6 @@ export function activate(context: vscode.ExtensionContext): void {
         handleSearchLocatorSnippet(snippet),
       onSelectParameterVariant: (variantId: string) =>
         handleSelectParameterVariant(variantId),
-      onApplyCustomParameter: (
-        overrides: Record<string, string | number | boolean>
-      ) => handleApplyCustomParameter(overrides),
     };
   };
 
@@ -629,71 +692,6 @@ export function activate(context: vscode.ExtensionContext): void {
     );
   };
 
-  handleApplyCustomParameter = async (
-    rawOverrides: Record<string, string | number | boolean>
-  ): Promise<void> => {
-    if (!browserManager || !currentParameterizedSession) {
-      return;
-    }
-    const { baseResolved, reResolveWithOverrides } = currentParameterizedSession;
-    const parsedOverrides: Record<string, SerializedArg> = {};
-    for (const [k, rawVal] of Object.entries(rawOverrides)) {
-      if (typeof rawVal === 'string') {
-        const trimmed = rawVal.trim();
-        if (trimmed === 'true') {
-          parsedOverrides[k] = true;
-        } else if (trimmed === 'false') {
-          parsedOverrides[k] = false;
-        } else if (
-          trimmed !== '' &&
-          !Number.isNaN(Number(trimmed)) &&
-          /^-?\d+(\.\d+)?$/.test(trimmed)
-        ) {
-          parsedOverrides[k] = Number(trimmed);
-        } else {
-          parsedOverrides[k] = rawVal;
-        }
-      } else {
-        parsedOverrides[k] = rawVal;
-      }
-    }
-
-    try {
-      const reResolved = reResolveWithOverrides(parsedOverrides);
-      if (!reResolved.descriptor) {
-        return;
-      }
-      const parameterInfo: HighlightParameterInfo = {
-        baseExpressionText: baseResolved.expressionText,
-        parameterNames: baseResolved.parameterNames,
-        activeVariantId: undefined,
-        customValues: parsedOverrides,
-        variants: baseResolved.variants.map((v) => ({
-          id: v.id,
-          label: v.label,
-          description: v.description,
-          parameters: v.parameters,
-          descriptor: v.descriptor,
-        })),
-      };
-      const highlightRes = await browserManager.highlightLocator(
-        reResolved.descriptor,
-        {
-          expressionText: baseResolved.expressionText,
-          strippedActionMethod: baseResolved.strippedActionMethod,
-          parameterInfo,
-        }
-      );
-      vscode.window.setStatusBarMessage(
-        `Playwright Inspector: ${highlightRes.statusText}`,
-        5000
-      );
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      vscode.window.showErrorMessage(`Playwright Locator Inspector: ${msg}`);
-    }
-  };
-
   handleSearchLocatorSnippet = async (snippet: string): Promise<void> => {
     if (!browserManager) {
       return;
@@ -724,7 +722,7 @@ export function activate(context: vscode.ExtensionContext): void {
         descriptor: targetDescriptor,
         expressionLabel: activeExpressionLabel,
         parameterInfo,
-      } = buildInitialHighlightPayload(resolved, (overrides) =>
+      } = await buildInitialHighlightPayload(resolved, (overrides) =>
         resolveLocatorFromSnippet({
           snippet,
           contextFilePath,
@@ -874,7 +872,7 @@ export function activate(context: vscode.ExtensionContext): void {
         descriptor: targetDescriptor,
         expressionLabel: activeExpressionLabel,
         parameterInfo,
-      } = buildInitialHighlightPayload(resolved, (overrides) =>
+      } = await buildInitialHighlightPayload(resolved, (overrides) =>
         resolveSelectionOrPosition(doc, pos, sel, overrides)
       );
 
@@ -1027,6 +1025,48 @@ export function activate(context: vscode.ExtensionContext): void {
             } else {
               editor.setDecorations(hoverInlineBadgeDecorationType, []);
             }
+            return;
+          }
+
+          if (
+            resolved.requiresParameterSelection &&
+            resolved.variants &&
+            resolved.variants.length > 0 &&
+            resolved.variantKind === 'context'
+          ) {
+            let matchedVariant = resolved.variants[0];
+            let matchedProbe: { browserReady: boolean; count: number; visibleCount: number } = {
+              browserReady: true,
+              count: 0,
+              visibleCount: 0,
+            };
+            for (const variant of resolved.variants) {
+              const p = await browserManager.probeLocatorCount(
+                variant.descriptor
+              );
+              if (seq !== selectionProbeSeq) {
+                return;
+              }
+              if (!p.browserReady) {
+                editor.setDecorations(hoverInlineBadgeDecorationType, []);
+                return;
+              }
+              if (p.count > 0) {
+                matchedVariant = variant;
+                matchedProbe = p;
+                break;
+              }
+            }
+            const text =
+              matchedProbe.count > 0
+                ? `Found in DOM: ${matchedProbe.count} (visible: ${matchedProbe.visibleCount}) [${matchedVariant.label}]`
+                : 'Found in DOM: 0 (not on current page)';
+            setHoverInlineBadge(
+              editor.document.uri,
+              targetLine,
+              text,
+              matchedProbe.count > 0 ? 'ok' : 'zero'
+            );
             return;
           }
 
