@@ -39,12 +39,26 @@ export interface WorkspacePlaywrightRuntime {
   config: PlaywrightConfigSettings;
 }
 
+export interface LoadPlaywrightConfigOptions {
+  /** Разрешить чтение нечувствительных переменных из .env-файлов проекта (по умолчанию false). */
+  readEnvFiles?: boolean;
+}
+
 const CONFIG_FILE_NAMES = [
   'playwright.config.ts',
   'playwright.config.js',
   'playwright.config.mjs',
   'playwright.config.cjs',
 ];
+
+const SENSITIVE_ENV_KEY_REGEX =
+  /(secret|token|pass|pwd|password|key|auth|cookie|session|jwt|bearer|cred|credential|private|cert|pem|signature|hash|dsn|connection_string)/i;
+
+const SENSITIVE_HEADER_NAME_REGEX =
+  /^(authorization|proxy-authorization|cookie|set-cookie|x-api-key|api-key|x-auth-token|x-access-token|x-csrf-token|x-xsrf-token)$|(secret|token|auth|key|pass|cookie|session|cred)/i;
+
+const SENSITIVE_JSON_FILENAME_REGEX =
+  /(secret|credential|service[-_]?account|private|passwd|password|apikey|api[-_]?key)/i;
 
 const IGNORED_SCAN_DIRS = new Set([
   'node_modules',
@@ -104,15 +118,56 @@ export function findPlaywrightProjectRoot(
   return firstPackageJsonDir || fallbackWorkspaceRoot || process.cwd();
 }
 
+export function isSensitiveEnvKey(key: string): boolean {
+  return SENSITIVE_ENV_KEY_REGEX.test(key);
+}
+
+export function isSensitiveHeaderName(name: string): boolean {
+  return SENSITIVE_HEADER_NAME_REGEX.test(name.trim());
+}
+
 /**
- * Читает переменные окружения из .env-файлов проекта без модификации глобального process.env.
+ * Проверяет, что URL использует http/https и не содержит встроенных учётных данных (user:pass@).
  */
-function loadProjectEnvVars(projectRoot: string): Record<string, string> {
+export function sanitizeBaseUrl(rawUrl?: string): string | undefined {
+  if (!rawUrl || typeof rawUrl !== 'string') {
+    return undefined;
+  }
+  const trimmed = rawUrl.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return undefined;
+    }
+    if (parsed.username || parsed.password) {
+      return undefined;
+    }
+    return trimmed;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Читает только нечувствительные переменные окружения (без секретов, токенов, паролей и ключей)
+ * без модификации глобального process.env. Файлы .env* читаются только при readEnvFiles === true.
+ */
+function loadProjectEnvVars(
+  projectRoot: string,
+  readEnvFiles: boolean
+): Record<string, string> {
   const result: Record<string, string> = {};
   for (const [key, val] of Object.entries(process.env)) {
-    if (typeof val === 'string') {
+    if (typeof val === 'string' && !isSensitiveEnvKey(key)) {
       result[key] = val;
     }
+  }
+
+  if (!readEnvFiles) {
+    return result;
   }
 
   const envFiles = [
@@ -143,6 +198,9 @@ function loadProjectEnvVars(projectRoot: string): Record<string, string> {
           continue;
         }
         const key = line.slice(0, eqIdx).trim();
+        if (!key || isSensitiveEnvKey(key)) {
+          continue;
+        }
         let value = line.slice(eqIdx + 1).trim();
         if (
           (value.startsWith('"') && value.endsWith('"')) ||
@@ -165,7 +223,11 @@ function loadProjectEnvVars(projectRoot: string): Record<string, string> {
 /**
  * Извлекает настройки из playwright.config.ts с помощью TypeScript AST.
  */
-export function loadPlaywrightConfigSettings(projectRoot: string): PlaywrightConfigSettings {
+export function loadPlaywrightConfigSettings(
+  projectRoot: string,
+  options?: LoadPlaywrightConfigOptions
+): PlaywrightConfigSettings {
+  const readEnvFiles = Boolean(options?.readEnvFiles);
   const settings: PlaywrightConfigSettings = {
     projectRoot,
     testIdAttribute: 'data-testid',
@@ -189,9 +251,10 @@ export function loadPlaywrightConfigSettings(projectRoot: string): PlaywrightCon
     }
   }
 
-  const envVars = loadProjectEnvVars(projectRoot);
-  if (envVars.QA_URL || envVars.BASE_URL) {
-    settings.baseURL = envVars.QA_URL || envVars.BASE_URL;
+  const envVars = loadProjectEnvVars(projectRoot, readEnvFiles);
+  const envBaseUrl = sanitizeBaseUrl(envVars.QA_URL || envVars.BASE_URL);
+  if (envBaseUrl) {
+    settings.baseURL = envBaseUrl;
   }
 
   if (!configPath) {
@@ -212,12 +275,15 @@ export function loadPlaywrightConfigSettings(projectRoot: string): PlaywrightCon
 
     const topLevelConsts = new Map<string, unknown>();
 
-    const evalSimpleNode = (node: ts.Node | undefined): unknown => {
+    const evalSimpleNode = (
+      node: ts.Node | undefined,
+      allowEnvLookup: boolean = true
+    ): unknown => {
       if (!node) {
         return undefined;
       }
       if (ts.isParenthesizedExpression(node) || ts.isAsExpression(node)) {
-        return evalSimpleNode(node.expression);
+        return evalSimpleNode(node.expression, allowEnvLookup);
       }
       if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) {
         return node.text;
@@ -232,7 +298,7 @@ export function loadPlaywrightConfigSettings(projectRoot: string): PlaywrightCon
         return false;
       }
       if (ts.isIdentifier(node)) {
-        if (topLevelConsts.has(node.text)) {
+        if (allowEnvLookup && topLevelConsts.has(node.text)) {
           return topLevelConsts.get(node.text);
         }
         return undefined;
@@ -244,6 +310,9 @@ export function loadPlaywrightConfigSettings(projectRoot: string): PlaywrightCon
         node.expression.expression.text === 'process' &&
         node.expression.name.text === 'env'
       ) {
+        if (!allowEnvLookup || isSensitiveEnvKey(node.name.text)) {
+          return undefined;
+        }
         return envVars[node.name.text];
       }
       if (
@@ -251,12 +320,14 @@ export function loadPlaywrightConfigSettings(projectRoot: string): PlaywrightCon
         (node.operatorToken.kind === ts.SyntaxKind.BarBarToken ||
           node.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken)
       ) {
-        const left = evalSimpleNode(node.left);
-        return left !== undefined && left !== '' ? left : evalSimpleNode(node.right);
+        const left = evalSimpleNode(node.left, allowEnvLookup);
+        return left !== undefined && left !== ''
+          ? left
+          : evalSimpleNode(node.right, allowEnvLookup);
       }
       if (ts.isArrayLiteralExpression(node)) {
         return node.elements
-          .map((el) => evalSimpleNode(el))
+          .map((el) => evalSimpleNode(el, allowEnvLookup))
           .filter((v) => v !== undefined);
       }
       if (ts.isObjectLiteralExpression(node)) {
@@ -268,11 +339,11 @@ export function loadPlaywrightConfigSettings(projectRoot: string): PlaywrightCon
                 ? prop.name.text
                 : undefined;
             if (key) {
-              obj[key] = evalSimpleNode(prop.initializer);
+              obj[key] = evalSimpleNode(prop.initializer, allowEnvLookup);
             }
           } else if (ts.isShorthandPropertyAssignment(prop)) {
             const key = prop.name.text;
-            obj[key] = topLevelConsts.get(key);
+            obj[key] = allowEnvLookup ? topLevelConsts.get(key) : undefined;
           }
         }
         return obj;
@@ -283,8 +354,12 @@ export function loadPlaywrightConfigSettings(projectRoot: string): PlaywrightCon
     for (const stmt of sourceFile.statements) {
       if (ts.isVariableStatement(stmt)) {
         for (const decl of stmt.declarationList.declarations) {
-          if (ts.isIdentifier(decl.name) && decl.initializer) {
-            const val = evalSimpleNode(decl.initializer);
+          if (
+            ts.isIdentifier(decl.name) &&
+            decl.initializer &&
+            !isSensitiveEnvKey(decl.name.text)
+          ) {
+            const val = evalSimpleNode(decl.initializer, true);
             if (val !== undefined) {
               topLevelConsts.set(decl.name.text, val);
             }
@@ -300,12 +375,39 @@ export function loadPlaywrightConfigSettings(projectRoot: string): PlaywrightCon
             ts.isIdentifier(prop.name) || ts.isStringLiteral(prop.name)
               ? prop.name.text
               : '';
-          const val = evalSimpleNode(prop.initializer);
+
+          if (propName === 'extraHTTPHeaders') {
+            // Запрещаем подстановку process.env и отбрасываем любые чувствительные заголовки
+            const rawHeaders = evalSimpleNode(prop.initializer, false);
+            if (
+              rawHeaders &&
+              typeof rawHeaders === 'object' &&
+              !Array.isArray(rawHeaders)
+            ) {
+              const headers: Record<string, string> = {};
+              for (const [k, v] of Object.entries(
+                rawHeaders as Record<string, unknown>
+              )) {
+                if (typeof v === 'string' && !isSensitiveHeaderName(k)) {
+                  headers[k] = v;
+                }
+              }
+              if (Object.keys(headers).length > 0) {
+                settings.extraHTTPHeaders = headers;
+              }
+            }
+            continue;
+          }
+
+          const val = evalSimpleNode(prop.initializer, true);
 
           if (propName === 'testIdAttribute' && typeof val === 'string' && val.trim()) {
             settings.testIdAttribute = val.trim();
-          } else if (propName === 'baseURL' && typeof val === 'string' && val.trim()) {
-            settings.baseURL = val.trim();
+          } else if (propName === 'baseURL' && typeof val === 'string') {
+            const safeUrl = sanitizeBaseUrl(val);
+            if (safeUrl) {
+              settings.baseURL = safeUrl;
+            }
           } else if (propName === 'ignoreHTTPSErrors' && typeof val === 'boolean') {
             settings.ignoreHTTPSErrors = val;
           } else if (
@@ -319,21 +421,6 @@ export function loadPlaywrightConfigSettings(projectRoot: string): PlaywrightCon
               settings.viewport = { width: vp.width, height: vp.height };
             }
           } else if (
-            propName === 'extraHTTPHeaders' &&
-            val &&
-            typeof val === 'object' &&
-            !Array.isArray(val)
-          ) {
-            const headers: Record<string, string> = {};
-            for (const [k, v] of Object.entries(val as Record<string, unknown>)) {
-              if (typeof v === 'string') {
-                headers[k] = v;
-              }
-            }
-            if (Object.keys(headers).length > 0) {
-              settings.extraHTTPHeaders = headers;
-            }
-          } else if (
             propName === 'launchOptions' &&
             ts.isObjectLiteralExpression(prop.initializer)
           ) {
@@ -343,7 +430,7 @@ export function loadPlaywrightConfigSettings(projectRoot: string): PlaywrightCon
                 (ts.isIdentifier(loProp.name) || ts.isStringLiteral(loProp.name)) &&
                 loProp.name.text === 'args'
               ) {
-                const argsVal = evalSimpleNode(loProp.initializer);
+                const argsVal = evalSimpleNode(loProp.initializer, true);
                 if (Array.isArray(argsVal) && argsVal.every((x) => typeof x === 'string')) {
                   settings.launchArgs = argsVal as string[];
                 }
@@ -353,8 +440,11 @@ export function loadPlaywrightConfigSettings(projectRoot: string): PlaywrightCon
         } else if (ts.isShorthandPropertyAssignment(prop)) {
           if (prop.name.text === 'baseURL') {
             const val = topLevelConsts.get('baseURL');
-            if (typeof val === 'string' && val.trim()) {
-              settings.baseURL = val.trim();
+            if (typeof val === 'string') {
+              const safeUrl = sanitizeBaseUrl(val);
+              if (safeUrl) {
+                settings.baseURL = safeUrl;
+              }
             }
           }
         }
@@ -503,7 +593,8 @@ export function discoverStorageStateFiles(projectRoot: string): StorageStateCand
     if (
       baseName === 'package.json' ||
       baseName === 'package-lock.json' ||
-      baseName.startsWith('tsconfig')
+      baseName.startsWith('tsconfig') ||
+      SENSITIVE_JSON_FILENAME_REGEX.test(baseName)
     ) {
       return;
     }
@@ -582,10 +673,11 @@ export function discoverStorageStateFiles(projectRoot: string): StorageStateCand
  */
 export function resolveWorkspacePlaywright(
   activeFilePath?: string,
-  workspaceRoot?: string
+  workspaceRoot?: string,
+  options?: LoadPlaywrightConfigOptions
 ): WorkspacePlaywrightRuntime {
   const projectRoot = findPlaywrightProjectRoot(activeFilePath, workspaceRoot);
-  const config = loadPlaywrightConfigSettings(projectRoot);
+  const config = loadPlaywrightConfigSettings(projectRoot, options);
 
   const anchorPaths: string[] = [];
   if (activeFilePath) {

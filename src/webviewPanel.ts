@@ -25,6 +25,29 @@ export class BrowserWebviewPanel {
   private readonly panel: vscode.WebviewPanel;
   private readonly browserManager: BrowserManager;
   private readonly disposables: vscode.Disposable[] = [];
+  private historyProject?: string;
+  private readonly workspaceState: vscode.Memento;
+
+  private postHistory(projectRoot: string): void {
+    const urls = this.workspaceState.get<string[]>(`navigationHistory:${projectRoot}`, []);
+    void this.panel.webview.postMessage({ type: 'navigationHistory', payload: { urls } });
+  }
+
+  private async updateHistory(projectRoot: string, visited?: string[]): Promise<void> {
+    const key = `navigationHistory:${projectRoot}`;
+    let urls = visited ? this.workspaceState.get<string[]>(key, []) : [];
+    for (const value of visited ?? []) {
+      let url: URL;
+      try { url = new URL(value); } catch { continue; }
+      if (!/^https?:$/.test(url.protocol) || url.username || url.password ||
+          /(?:[?&#]|^)[^=&#]*(?:token|secret|pass(?:word)?|credential|session|auth|api[_-]?key)[^=&#]*=/i.test(url.search + url.hash) ||
+          /(?:[?&#]|^)code=/i.test(url.search + url.hash)) continue;
+      const address = url.href;
+      urls = [address, ...urls.filter((entry) => entry !== address)].slice(0, 5);
+    }
+    await this.workspaceState.update(key, urls);
+    if (this.historyProject === projectRoot) this.postHistory(projectRoot);
+  }
   private onSearchLocatorSnippet?: SearchLocatorSnippetHandler;
   private onSelectParameterVariant?: SelectParameterVariantHandler;
   private onApplyCustomParameter?: ApplyCustomParameterHandler;
@@ -35,9 +58,9 @@ export class BrowserWebviewPanel {
     options?: {
       activeFilePath?: string;
       workspaceRoot?: string;
-      initialUrl?: string;
       storageStatePath?: string;
       viewport?: { width: number; height: number };
+      readEnvFiles?: boolean;
       onSearchLocatorSnippet?: SearchLocatorSnippetHandler;
       onSelectParameterVariant?: SelectParameterVariantHandler;
       onApplyCustomParameter?: ApplyCustomParameterHandler;
@@ -82,6 +105,7 @@ export class BrowserWebviewPanel {
     BrowserWebviewPanel.currentInstance = new BrowserWebviewPanel(
       panel,
       browserManager,
+      context.workspaceState,
       options?.onSearchLocatorSnippet,
       options?.onSelectParameterVariant,
       options?.onApplyCustomParameter
@@ -98,12 +122,14 @@ export class BrowserWebviewPanel {
   private constructor(
     panel: vscode.WebviewPanel,
     browserManager: BrowserManager,
+    workspaceState: vscode.Memento,
     onSearchLocatorSnippet?: SearchLocatorSnippetHandler,
     onSelectParameterVariant?: SelectParameterVariantHandler,
     onApplyCustomParameter?: ApplyCustomParameterHandler
   ) {
     this.panel = panel;
     this.browserManager = browserManager;
+    this.workspaceState = workspaceState;
     this.onSearchLocatorSnippet = onSearchLocatorSnippet;
     this.onSelectParameterVariant = onSelectParameterVariant;
     this.onApplyCustomParameter = onApplyCustomParameter;
@@ -131,12 +157,19 @@ export class BrowserWebviewPanel {
     this.browserManager.on('screencastFrame', onFrame);
     this.browserManager.on('stateChanged', onState);
     this.browserManager.on('highlightChanged', onHighlight);
+    const onVisit = (projectRoot: string, urls: string[]) => {
+      void this.updateHistory(projectRoot, urls).catch(() => {
+        vscode.window.showErrorMessage('Playwright Browser Inspector: could not save navigation history.');
+      });
+    };
+    this.browserManager.on('navigationVisited', onVisit);
 
     this.disposables.push(
       new vscode.Disposable(() => {
         this.browserManager.off('screencastFrame', onFrame);
         this.browserManager.off('stateChanged', onState);
         this.browserManager.off('highlightChanged', onHighlight);
+        this.browserManager.off('navigationVisited', onVisit);
       })
     );
 
@@ -162,6 +195,10 @@ export class BrowserWebviewPanel {
       type: 'state',
       payload: state,
     });
+    if (state.isRunning && this.historyProject !== state.projectRoot) {
+      this.historyProject = state.projectRoot;
+      this.postHistory(state.projectRoot);
+    }
   }
 
   public setSearchInputValue(expressionText: string): void {
@@ -196,6 +233,10 @@ export class BrowserWebviewPanel {
       switch (msg.type) {
         case 'ready':
           this.postState(this.browserManager.getStateSnapshot());
+          if (this.historyProject) this.postHistory(this.historyProject);
+          break;
+        case 'clearNavigationHistory':
+          if (this.historyProject) await this.updateHistory(this.historyProject);
           break;
         case 'navigate':
           if (typeof msg.url === 'string') {
@@ -330,13 +371,13 @@ export class BrowserWebviewPanel {
 
     /* Top control bar */
     .top-controls {
-      display: flex;
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
       align-items: stretch;
       gap: 8px;
       padding: 8px 10px;
       background: var(--panel-bg);
       border-bottom: 1px solid var(--border);
-      flex-wrap: wrap;
     }
     .control-group {
       display: flex;
@@ -347,16 +388,28 @@ export class BrowserWebviewPanel {
       border: 1px solid var(--border);
       border-radius: 8px;
       padding: 6px 8px;
+      min-width: 0;
     }
     .control-group.nav-group {
-      flex: 1 1 360px;
-      min-width: 280px;
+      grid-column: 1 / -1;
     }
-    .control-group.auth-group {
-      flex: 0 1 auto;
+    .page-spinner {
+      width: 32px;
+      height: 32px;
+      margin: auto;
+      border: 3px solid var(--muted);
+      border-top-color: var(--accent-link);
+      border-radius: 50%;
+      animation: page-spin 0.8s linear infinite;
     }
-    .control-group.viewport-group {
-      flex: 0 0 auto;
+    @keyframes page-spin { to { transform: rotate(360deg); } }
+    @media (prefers-reduced-motion: reduce) {
+      .page-spinner { animation: none; }
+    }
+    .auth-group .select-wrapper,
+    .viewport-group .select-wrapper {
+      flex: 1;
+      min-width: 0;
     }
     .group-label {
       font-size: 10px;
@@ -395,9 +448,16 @@ export class BrowserWebviewPanel {
       border-color: var(--accent);
       background: var(--btn-hover-bg);
     }
+    body {
+      --primary-border: rgba(56, 189, 248, 0.45);
+    }
+    body.vscode-light,
+    body.vscode-high-contrast-light {
+      --primary-border: rgba(2, 132, 199, 0.45);
+    }
     .btn-primary {
       background: rgba(56, 189, 248, 0.14);
-      border-color: rgba(56, 189, 248, 0.45);
+      border-color: var(--primary-border);
       color: var(--accent-link);
     }
     .btn-primary:hover {
@@ -416,7 +476,7 @@ export class BrowserWebviewPanel {
     body.vscode-light .btn-primary,
     body.vscode-high-contrast-light .btn-primary {
       background: rgba(2, 132, 199, 0.12);
-      border-color: rgba(2, 132, 199, 0.45);
+      border-color: var(--primary-border);
       color: #0369a1;
     }
     body.vscode-light .btn-clear,
@@ -425,15 +485,24 @@ export class BrowserWebviewPanel {
       border-color: rgba(220, 38, 38, 0.35);
       color: #b91c1c;
     }
-    .btn-action {
-      height: 26px;
-      padding: 0 10px;
-      font-size: 11.5px;
+    #btn-go,
+    #btn-history,
+    #btn-browse-storage,
+    #btn-clear-highlight,
+    #btn-search-locator {
+      flex: none;
+      width: 64px;
+    }
+    #btn-back,
+    #btn-forward,
+    #btn-reload {
+      flex: none;
+      width: 32px;
     }
 
     .url-input {
       flex: 1;
-      min-width: 160px;
+      min-width: 0;
       height: 28px;
       background: var(--input-bg);
       color: var(--input-fg);
@@ -448,8 +517,115 @@ export class BrowserWebviewPanel {
     .param-custom-input::placeholder {
       color: var(--input-placeholder);
     }
-    .url-input:focus {
+    .nav-group.is-new:has(.url-input:placeholder-shown) {
+      background: color-mix(in srgb, var(--card-bg) 96%, var(--accent));
+      border-color: color-mix(in srgb, var(--border) 65%, var(--accent));
+    }
+    .nav-group.is-new .url-input:placeholder-shown {
+      background: color-mix(in srgb, var(--input-bg) 94%, var(--accent));
+      border-color: color-mix(in srgb, var(--border-light) 55%, var(--accent));
+    }
+    .nav-group .url-input:focus {
       border-color: var(--accent);
+    }
+    .navigation-error {
+      color: var(--vscode-errorForeground, #f87171);
+      font-size: 12px;
+      overflow-wrap: anywhere;
+    }
+    .history-control {
+      position: relative;
+      flex: none;
+    }
+    .history-popover,
+    .select-popover {
+      position: absolute;
+      z-index: 2;
+      top: calc(100% + 4px);
+      padding: 6px;
+      border: 1px solid var(--border-light);
+      border-radius: 6px;
+      background: var(--card-bg);
+      box-shadow: 0 4px 16px var(--vscode-widget-shadow, rgba(0, 0, 0, 0.28));
+    }
+    .history-popover {
+      right: 0;
+      width: 320px;
+      max-width: calc(100vw - 38px);
+    }
+    .select-popover {
+      left: 0;
+      width: max(100%, 200px);
+      max-width: calc(100vw - 38px);
+      max-height: min(220px, 40vh);
+      overflow: auto;
+    }
+    .viewport-group .select-popover {
+      left: auto;
+      right: 0;
+    }
+    .elements-select-wrapper .select-popover {
+      position: fixed;
+      z-index: 10;
+      box-sizing: border-box;
+      max-width: none;
+    }
+    .select-option {
+      display: block;
+      width: 100%;
+      min-height: 28px;
+      height: auto;
+      padding-block: 5px;
+      white-space: normal;
+      overflow-wrap: anywhere;
+      text-align: left;
+    }
+    .select-option + .select-option {
+      margin-top: 3px;
+    }
+    .select-option[aria-selected="true"] {
+      background: var(--btn-hover-bg);
+      border-color: var(--accent);
+    }
+    #elements-options .select-option[aria-selected="true"] {
+      border-color: var(--border-light);
+    }
+    .select-popover .select-option:hover,
+    #elements-options .select-option:hover,
+    #history-entries .history-entry:hover {
+      border-color: var(--primary-border);
+      box-shadow: inset 0 0 0 1px var(--primary-border);
+      transition: background 0.15s;
+    }
+    #elements-options .select-option {
+      transition: background 0.15s;
+    }
+    .select-option:focus-visible {
+      outline: 1px solid var(--accent);
+      outline-offset: 1px;
+    }
+    .history-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 4px;
+    }
+    #history-entries {
+      max-height: min(220px, 40vh);
+      overflow: auto;
+    }
+    .history-entry {
+      display: block;
+      width: 100%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      text-align: left;
+      margin-top: 3px;
+    }
+    .history-empty {
+      padding: 5px 4px;
+      color: var(--muted);
+      font-size: 12px;
     }
 
     .select-wrapper {
@@ -458,8 +634,9 @@ export class BrowserWebviewPanel {
       align-items: center;
     }
     .select-box {
-      -webkit-appearance: none;
-      appearance: none;
+      width: 100%;
+      min-width: 0;
+      text-align: left;
       height: 28px;
       background: var(--input-bg);
       color: var(--input-fg);
@@ -474,22 +651,26 @@ export class BrowserWebviewPanel {
       overflow: hidden;
       text-overflow: ellipsis;
     }
-    .select-box.auth-select {
-      width: 240px;
+    .select-box:enabled:hover,
+    #btn-history:hover {
+      border-color: var(--primary-border);
+      box-shadow: inset 0 0 0 1px var(--primary-border);
     }
-    .select-box.vp-select {
-      width: 155px;
-    }
-    .select-box:hover,
-    .select-box:focus {
+    .select-box:focus-visible {
       border-color: var(--accent);
+    }
+    #elements-select:disabled {
+      cursor: default;
+    }
+    #elements-select:disabled + .select-arrow {
+      visibility: hidden;
     }
     .select-arrow {
       position: absolute;
       right: 9px;
       pointer-events: none;
       color: var(--muted);
-      font-size: 10px;
+      font-size: 16px;
     }
 
     /* Locator inspector card */
@@ -593,7 +774,7 @@ export class BrowserWebviewPanel {
     }
 
     .inspector-details {
-      display: none;
+      display: flex;
       flex-direction: column;
       gap: 5px;
       margin-top: 2px;
@@ -643,6 +824,8 @@ export class BrowserWebviewPanel {
       scrollbar-width: thin;
     }
     .code-line.pw-chain {
+      height: 24px;
+      overflow-y: hidden;
       color: var(--code-pw);
     }
 
@@ -654,6 +837,10 @@ export class BrowserWebviewPanel {
       flex: 1;
       min-width: 0;
       overflow: hidden;
+    }
+    #elements-row,
+    .elements-toolbar {
+      overflow: visible;
     }
     .chips-scroll-track {
       display: flex;
@@ -747,7 +934,7 @@ export class BrowserWebviewPanel {
     .viewport-host {
       flex: 1;
       display: flex;
-      align-items: flex-start;
+      align-items: center;
       justify-content: center;
       overflow: auto;
       background: var(--viewport-bg);
@@ -786,45 +973,53 @@ export class BrowserWebviewPanel {
 <body>
   <div class="top-controls">
     <!-- 1. Navigation -->
-    <div class="control-group nav-group">
+    <div class="control-group nav-group is-new" id="navigation">
       <div class="group-label">Navigation</div>
       <div class="group-row">
         <button class="btn" id="btn-back" title="Back">←</button>
         <button class="btn" id="btn-forward" title="Forward">→</button>
         <button class="btn" id="btn-reload" title="Reload page">↻</button>
-        <input class="url-input" id="url-input" type="text" placeholder="Enter URL (e.g. https://playwright.dev)" />
+        <input class="url-input" id="url-input" type="text" aria-label="URL" aria-describedby="navigation-error" placeholder="Enter a URL to check the locator" />
         <button class="btn btn-primary" id="btn-go" title="Navigate to URL">Go</button>
-      </div>
-    </div>
-
-    <!-- 2. Auth session (storageState) -->
-    <div class="control-group auth-group">
-      <div class="group-label">Auth session</div>
-      <div class="group-row">
-        <div class="select-wrapper">
-          <select class="select-box auth-select" id="storage-select" title="Select a Playwright storageState JSON file (cookies / localStorage)">
-            <option value="">No auth (clean session)</option>
-          </select>
-          <span class="select-arrow">▾</span>
+        <div class="history-control" id="history-control">
+          <button class="btn" id="btn-history" aria-expanded="false" aria-controls="history-popover">History</button>
+          <div class="history-popover" id="history-popover" role="region" aria-label="Navigation history" hidden>
+            <div class="history-header">
+              <span class="group-label">Navigation history</span>
+              <button class="btn btn-action" id="btn-clear-history" aria-label="Clear navigation history">Clear</button>
+            </div>
+            <div id="history-entries"><div class="history-empty">No navigation history</div></div>
+          </div>
         </div>
-        <button class="btn" id="btn-browse-storage" title="Load another storageState JSON file from disk">File...</button>
       </div>
+      <div class="navigation-error" id="navigation-error" role="alert" hidden></div>
     </div>
 
-    <!-- 3. Viewport -->
+    <!-- 2. Viewport -->
     <div class="control-group viewport-group">
       <div class="group-label">Viewport</div>
       <div class="group-row">
         <div class="select-wrapper">
-          <select class="select-box vp-select" id="viewport-select" title="Browser viewport size">
-            <option value="1440x900">Desktop 1440×900</option>
-            <option value="1920x1080">Desktop 1920×1080</option>
-            <option value="393x851">Mobile 393×851</option>
-          </select>
-          <span class="select-arrow">▾</span>
+          <button type="button" class="select-box" id="viewport-select" aria-label="Viewport" aria-haspopup="listbox" aria-expanded="false" aria-controls="viewport-options" aria-describedby="viewport-value"><span id="viewport-value">Desktop 1440×900</span></button>
+          <span class="select-arrow" aria-hidden="true">▾</span>
+          <div class="select-popover" id="viewport-options" role="listbox" aria-label="Viewport" hidden></div>
         </div>
       </div>
     </div>
+
+    <!-- 3. Auth session (storageState) -->
+    <div class="control-group auth-group">
+      <div class="group-label">Auth session</div>
+      <div class="group-row">
+        <div class="select-wrapper">
+          <button type="button" class="select-box" id="storage-select" aria-label="Auth session" aria-haspopup="listbox" aria-expanded="false" aria-controls="storage-options" aria-describedby="storage-value"><span id="storage-value">No auth (clean session)</span></button>
+          <span class="select-arrow" aria-hidden="true">▾</span>
+          <div class="select-popover" id="storage-options" role="listbox" aria-label="Auth session" hidden></div>
+        </div>
+        <button class="btn" id="btn-browse-storage" title="Load another storageState JSON file from disk">File</button>
+      </div>
+    </div>
+
   </div>
 
   <!-- 4. Locator inspector -->
@@ -832,7 +1027,7 @@ export class BrowserWebviewPanel {
     <div class="inspector-header">
       <div class="inspector-title-area">
         <span class="group-label">Locator inspector</span>
-        <span id="locator-status" class="badge badge-idle">Waiting for locator</span>
+        <span id="locator-status" class="badge badge-idle" role="status">Waiting for page</span>
       </div>
       <div class="inspector-actions-area">
         <button class="btn btn-clear btn-action" id="btn-clear-highlight" style="display: none;" title="Remove highlight overlay from the page and clear search results">Clear</button>
@@ -859,15 +1054,22 @@ export class BrowserWebviewPanel {
         <span class="block-badge">Playwright</span>
         <div class="code-line pw-chain" id="locator-chain"></div>
       </div>
-      <div class="inspector-block" id="elements-row" style="display: none;">
+      <div class="inspector-block" id="elements-row">
         <span class="block-badge">Elements</span>
-        <div class="elements-toolbar" id="elements-list"></div>
+        <div class="elements-toolbar" id="elements-list">
+          <div class="select-wrapper elements-select-wrapper">
+            <button type="button" class="select-box elements-select" id="elements-select" disabled aria-label="Elements" aria-haspopup="listbox" aria-expanded="false" aria-controls="elements-options" aria-describedby="elements-value"><span id="elements-value"></span></button>
+            <span class="select-arrow" aria-hidden="true">▾</span>
+            <div class="select-popover" id="elements-options" role="listbox" aria-label="Elements" hidden></div>
+          </div>
+        </div>
       </div>
     </div>
   </div>
 
   <div class="viewport-host" id="viewport-host">
-    <div class="empty-placeholder" id="placeholder">Launching Chromium and connecting CDP Screencast...</div>
+    <div class="empty-placeholder" id="placeholder">Waiting for navigation</div>
+    <div class="page-spinner" id="page-spinner" role="progressbar" aria-label="Loading page" hidden></div>
     <img id="screen-img" tabindex="0" style="display: none;" alt="Playwright Screencast" />
   </div>
 
@@ -875,30 +1077,42 @@ export class BrowserWebviewPanel {
     const vscode = acquireVsCodeApi();
 
     const urlInput = document.getElementById('url-input');
+    const navigation = document.getElementById('navigation');
+    const navigationError = document.getElementById('navigation-error');
+    const historyControl = document.getElementById('history-control');
+    const historyPopover = document.getElementById('history-popover');
+    const historyEntries = document.getElementById('history-entries');
+    const btnHistory = document.getElementById('btn-history');
+    const btnClearHistory = document.getElementById('btn-clear-history');
     const btnGo = document.getElementById('btn-go');
     const btnBack = document.getElementById('btn-back');
     const btnForward = document.getElementById('btn-forward');
     const btnReload = document.getElementById('btn-reload');
-    const storageSelect = document.getElementById('storage-select');
     const btnBrowseStorage = document.getElementById('btn-browse-storage');
-    const viewportSelect = document.getElementById('viewport-select');
     const btnClearHighlight = document.getElementById('btn-clear-highlight');
     const locatorSearchInput = document.getElementById('locator-search-input');
     const btnSearchLocator = document.getElementById('btn-search-locator');
     const screenImg = document.getElementById('screen-img');
     const placeholder = document.getElementById('placeholder');
     const locatorStatus = document.getElementById('locator-status');
-    const inspectorDetails = document.getElementById('inspector-details');
+    const pageSpinner = document.getElementById('page-spinner');
     const locatorChain = document.getElementById('locator-chain');
     const paramRow = document.getElementById('param-row');
     const paramBadge = document.getElementById('param-badge');
     const paramToolbar = document.getElementById('param-toolbar');
-    const elementsRow = document.getElementById('elements-row');
-    const elementsList = document.getElementById('elements-list');
+    const elementsButton = document.getElementById('elements-select');
 
     let viewportWidth = 1440;
     let viewportHeight = 900;
     let lastMoveSent = 0;
+    let pageReady = false;
+    let currentUrl = '';
+    let hasNavigated = false;
+    let hasUrlDraft = false;
+    let submittedUrl = '';
+    let navigationWasPending = false;
+    let navigationLoading = false;
+    let resettingUrl = false;
 
     function cleanAndCompactCode(rawText) {
       if (!rawText) return '';
@@ -929,7 +1143,8 @@ export class BrowserWebviewPanel {
 
     function autoResizeLocatorInput() {
       locatorSearchInput.style.height = 'auto';
-      const scrollH = locatorSearchInput.scrollHeight;
+      // Длинный плейсхолдер не должен менять высоту пустого поля.
+      const scrollH = locatorSearchInput.value ? locatorSearchInput.scrollHeight : 28;
       const targetH = Math.max(28, Math.min(110, scrollH));
       locatorSearchInput.style.height = targetH + 'px';
       locatorSearchInput.style.overflowY = scrollH > 110 ? 'auto' : 'hidden';
@@ -940,15 +1155,13 @@ export class BrowserWebviewPanel {
     });
 
     function resetInspectorPanel(clearSearchField = false) {
-      locatorStatus.textContent = 'Waiting for locator';
+      locatorStatus.textContent = pageReady ? 'Waiting for locator' : 'Waiting for page';
       locatorStatus.className = 'badge badge-idle';
-      inspectorDetails.style.display = 'none';
       btnClearHighlight.style.display = 'none';
       locatorChain.textContent = '';
       paramToolbar.innerHTML = '';
       paramRow.style.display = 'none';
-      elementsList.innerHTML = '';
-      elementsRow.style.display = 'none';
+      renderElements([], null);
       if (clearSearchField) {
         locatorSearchInput.value = '';
         autoResizeLocatorInput();
@@ -962,7 +1175,7 @@ export class BrowserWebviewPanel {
       }
       locatorSearchInput.value = cleaned;
       autoResizeLocatorInput();
-      locatorStatus.textContent = 'Searching...';
+      locatorStatus.textContent = pageReady ? 'Searching...' : 'Waiting for page';
       locatorStatus.className = 'badge badge-idle';
       btnClearHighlight.style.display = 'inline-flex';
       vscode.postMessage({
@@ -1004,14 +1217,90 @@ export class BrowserWebviewPanel {
       }
     });
 
-    function triggerNavigate() {
-      const url = urlInput.value.trim();
-      if (url) {
-        vscode.postMessage({ type: 'navigate', url });
-      }
+    function showNavigationError(message) {
+      if (navigationError.textContent !== message) navigationError.textContent = message;
+      navigationError.hidden = !message;
+      if (message) urlInput.setAttribute('aria-invalid', 'true');
+      else urlInput.removeAttribute('aria-invalid');
     }
 
+    function navigateTo(url) {
+      if (!url) return;
+      resettingUrl = false;
+      hasUrlDraft = true;
+      submittedUrl = url;
+      navigationWasPending = false;
+      showNavigationError('');
+      vscode.postMessage({ type: 'navigate', url });
+    }
+
+    function triggerNavigate() {
+      navigateTo(urlInput.value.trim());
+    }
+
+    function setHistoryOpen(open, restoreFocus = false) {
+      historyPopover.hidden = !open;
+      btnHistory.setAttribute('aria-expanded', String(open));
+      if (restoreFocus) btnHistory.focus();
+    }
+
+    function renderNavigationHistory(urls) {
+      const focusedEntry = historyEntries.contains(document.activeElement)
+        ? document.activeElement.title : '';
+      historyEntries.replaceChildren();
+      if (!urls.length) {
+        const empty = document.createElement('div');
+        empty.className = 'history-empty';
+        empty.textContent = 'No navigation history';
+        historyEntries.appendChild(empty);
+      }
+      let nextFocus;
+      urls.forEach((url) => {
+        const entry = document.createElement('button');
+        entry.className = 'btn history-entry';
+        entry.textContent = url;
+        entry.title = url;
+        entry.setAttribute('aria-label', url);
+        entry.addEventListener('click', () => {
+          setHistoryOpen(false, true);
+          urlInput.value = url;
+          navigateTo(url);
+        });
+        historyEntries.appendChild(entry);
+        if (url === focusedEntry) nextFocus = entry;
+      });
+      if (focusedEntry && !historyPopover.hidden) (nextFocus || btnClearHistory).focus();
+    }
+
+    btnHistory.addEventListener('click', () => setHistoryOpen(historyPopover.hidden));
+    btnClearHistory.addEventListener('click', () => vscode.postMessage({ type: 'clearNavigationHistory' }));
+    document.addEventListener('click', (e) => {
+      if (!historyPopover.hidden && !historyControl.contains(e.target)) setHistoryOpen(false);
+    });
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && !historyPopover.hidden) {
+        e.preventDefault();
+        e.stopPropagation();
+        setHistoryOpen(false, historyPopover.contains(document.activeElement));
+      }
+    }, true);
+
     btnGo.addEventListener('click', triggerNavigate);
+    urlInput.addEventListener('input', () => {
+      const hadNavigation = Boolean(currentUrl || submittedUrl || navigationLoading);
+      hasUrlDraft = true;
+      submittedUrl = '';
+      if (urlInput.value.trim() || resettingUrl || !hadNavigation) return;
+      resettingUrl = true;
+      pageReady = false;
+      currentUrl = '';
+      navigationLoading = false;
+      showNavigationError('');
+      screenImg.removeAttribute('src');
+      resetInspectorPanel();
+      updateScreen();
+      vscode.postMessage({ type: 'navigate', url: 'about:blank' });
+    });
     urlInput.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') {
         triggerNavigate();
@@ -1027,20 +1316,160 @@ export class BrowserWebviewPanel {
       resetInspectorPanel(true);
     });
 
-    storageSelect.addEventListener('change', () => {
-      vscode.postMessage({
-        type: 'setStorageState',
-        storageStatePath: storageSelect.value,
-      });
-    });
+    let openSelect;
 
-    viewportSelect.addEventListener('change', () => {
-      const [w, h] = viewportSelect.value.split('x').map(Number);
+    function createSelect(id, onSelect) {
+      const trigger = document.getElementById(id);
+      const wrapper = trigger.parentElement;
+      const listbox = document.getElementById(trigger.getAttribute('aria-controls'));
+      const label = document.getElementById(trigger.getAttribute('aria-describedby'));
+      let options = [];
+      let renderedOptions;
+      let value;
+
+      function showValue(nextValue) {
+        value = nextValue;
+        const current = options.find((option) => option.value === value);
+        label.textContent = current ? current.label : '';
+        trigger.title = current ? current.title || current.label : '';
+        for (const option of listbox.children) {
+          option.setAttribute('aria-selected', String(option.value === value));
+        }
+      }
+
+      function positionPopover() {
+        if (trigger.id !== 'elements-select' || listbox.hidden) return;
+        const rect = trigger.getBoundingClientRect();
+        const top = rect.bottom + 4;
+        listbox.style.top = top + 'px';
+        listbox.style.left = rect.left + 'px';
+        listbox.style.width = rect.width + 'px';
+        listbox.style.maxHeight = Math.max(0, Math.min(220, window.innerHeight - top - 8)) + 'px';
+      }
+
+      function focusOption(option) {
+        option.focus({ preventScroll: true });
+        if (option === trigger) return;
+        const optionRect = option.getBoundingClientRect();
+        const menuTop = listbox.getBoundingClientRect().top + listbox.clientTop;
+        const menuBottom = menuTop + listbox.clientHeight;
+        if (optionRect.top < menuTop) listbox.scrollTop += optionRect.top - menuTop;
+        else if (optionRect.bottom > menuBottom) listbox.scrollTop += optionRect.bottom - menuBottom;
+      }
+
+      function close(restoreFocus = false) {
+        listbox.hidden = true;
+        trigger.setAttribute('aria-expanded', 'false');
+        if (openSelect === control) openSelect = undefined;
+        if (restoreFocus) trigger.focus({ preventScroll: true });
+      }
+
+      function open(fromEnd = false) {
+        if (!options.length) return;
+        if (openSelect) openSelect.close();
+        if (!historyPopover.hidden) setHistoryOpen(false);
+        openSelect = control;
+        listbox.hidden = false;
+        positionPopover();
+        trigger.setAttribute('aria-expanded', 'true');
+        const current = listbox.querySelector('[aria-selected="true"]');
+        focusOption(current || (fromEnd ? listbox.lastElementChild : listbox.firstElementChild));
+      }
+
+      function update(nextOptions, nextValue) {
+        const signature = JSON.stringify(nextOptions);
+        const focused = listbox.contains(document.activeElement) ? document.activeElement : null;
+        if (signature !== renderedOptions) {
+          options = nextOptions;
+          renderedOptions = signature;
+          listbox.replaceChildren(...options.map((item) => {
+            const option = document.createElement('button');
+            option.type = 'button';
+            option.className = 'btn select-option';
+            option.setAttribute('role', 'option');
+            option.tabIndex = -1;
+            option.value = item.value;
+            option.textContent = item.label;
+            option.title = item.title || item.label;
+            option.addEventListener('click', () => {
+              const changed = item.value !== value;
+              showValue(item.value);
+              close(true);
+              if (changed) onSelect(item.value);
+            });
+            return option;
+          }));
+        }
+        showValue(nextValue);
+        positionPopover();
+        if (!listbox.hidden && focused && !listbox.contains(focused)) {
+          const nextFocus = Array.from(listbox.children).find((option) => option.value === focused.value);
+          focusOption(nextFocus || listbox.querySelector('[aria-selected="true"]') || listbox.firstElementChild || trigger);
+        }
+      }
+
+      const control = { wrapper, close, update };
+      if (trigger.id === 'elements-select') {
+        new ResizeObserver(positionPopover).observe(trigger);
+        window.addEventListener('resize', positionPopover);
+      }
+      trigger.addEventListener('click', () => listbox.hidden ? open() : close(true));
+      trigger.addEventListener('keydown', (e) => {
+        if (listbox.hidden && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) {
+          e.preventDefault();
+          open(e.key === 'ArrowUp');
+        }
+      });
+      listbox.addEventListener('keydown', (e) => {
+        let next;
+        if (e.key === 'ArrowDown') next = e.target.nextElementSibling || e.target;
+        else if (e.key === 'ArrowUp') next = e.target.previousElementSibling || e.target;
+        else if (e.key === 'Home') next = listbox.firstElementChild;
+        else if (e.key === 'End') next = listbox.lastElementChild;
+        else return;
+        e.preventDefault();
+        focusOption(next);
+      });
+      return control;
+    }
+
+    document.addEventListener('click', (e) => {
+      if (openSelect && !openSelect.wrapper.contains(e.target)) openSelect.close();
+    });
+    document.addEventListener('focusin', (e) => {
+      if (openSelect && !openSelect.wrapper.contains(e.target)) openSelect.close();
+    });
+    document.addEventListener('keydown', (e) => {
+      if (openSelect && e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        openSelect.close(true);
+      }
+    }, true);
+
+    const noAuthOption = { value: '', label: 'No auth (clean session)' };
+    const storageSelect = createSelect('storage-select', (storageStatePath) => {
+      vscode.postMessage({ type: 'setStorageState', storageStatePath });
+    });
+    storageSelect.update([noAuthOption], '');
+
+    const viewportOptions = [
+      { value: '1440x900', label: 'Desktop 1440×900' },
+      { value: '1920x1080', label: 'Desktop 1920×1080' },
+      { value: '393x851', label: 'Mobile 393×851' },
+    ];
+    const viewportSelect = createSelect('viewport-select', (value) => {
+      const [w, h] = value.split('x').map(Number);
       if (w && h) {
         viewportWidth = w;
         viewportHeight = h;
         vscode.postMessage({ type: 'setViewport', width: w, height: h });
       }
+    });
+    viewportSelect.update(viewportOptions, '1440x900');
+
+    const elementsSelect = createSelect('elements-select', (value) => {
+      vscode.postMessage({ type: 'focusElement', index: value === '' ? null : Number(value) });
     });
 
     function mapClientToViewport(clientX, clientY) {
@@ -1116,23 +1545,10 @@ export class BrowserWebviewPanel {
       }
     });
 
-    function formatElementSummaryText(el, totalCount) {
-      if (!el) return '';
-      const idx = el.index;
-      const testIdPart = el.testId ? ' testId="' + el.testId + '"' : '';
-      const rolePart = el.role ? ' role="' + el.role + '"' : '';
-      let nthHint = '.nth(' + idx + ')';
-      if (idx === 0 && totalCount > 1) {
-        nthHint = '.first() / .nth(0)';
-      } else if (idx === totalCount - 1 && totalCount > 1) {
-        nthHint = '.last() / .nth(' + idx + ')';
-      }
-      const textPreviewPart = el.textPreview
-        ? ' • "' + el.textPreview.slice(0, 75) + '"'
-        : el.valuePreview
-          ? ' • value="' + el.valuePreview.slice(0, 60) + '"'
-          : '';
-      return '#' + (idx + 1) + ' <' + el.tagName + testIdPart + rolePart + '> • ' + nthHint + textPreviewPart;
+    function formatElementSummaryText(el) {
+      const description = el.textPreview || el.imageAlt || el.nameAttr || el.testId || el.role || el.tagName;
+      const number = String(el.index + 1);
+      return description ? number + ' — ' + description : number;
     }
 
     function renderParameterBar(paramInfo) {
@@ -1210,93 +1626,84 @@ export class BrowserWebviewPanel {
     }
 
     function renderHighlight(hl) {
-      if (!hl) {
+      const waiting = !pageReady || Boolean(hl && hl.waitingForPage);
+      const cleanExpr = cleanAndCompactCode(hl && hl.expressionText || '');
+      if (cleanExpr && !locatorSearchInput.value.trim() && (waiting || document.activeElement !== locatorSearchInput)) {
+        locatorSearchInput.value = cleanExpr;
+        autoResizeLocatorInput();
+      }
+      if (!hl || waiting) {
         resetInspectorPanel(false);
+        if (waiting) locatorStatus.textContent = 'Waiting for page';
         return;
       }
       locatorStatus.textContent = hl.statusText;
       locatorStatus.className = 'badge ' + (hl.count > 0 ? 'badge-ok' : 'badge-zero');
-      inspectorDetails.style.display = 'flex';
       btnClearHighlight.style.display = 'inline-flex';
-      const cleanExpr = cleanAndCompactCode(hl.expressionText || '');
       locatorChain.textContent = hl.humanReadable;
-      if (cleanExpr && document.activeElement !== locatorSearchInput && !locatorSearchInput.value.trim()) {
-        locatorSearchInput.value = cleanExpr;
-      }
       autoResizeLocatorInput();
 
       renderParameterBar(hl.parameterInfo);
 
-      elementsList.innerHTML = '';
-      const els = hl.elements || [];
-      if (els.length > 0) {
-        elementsRow.style.display = 'flex';
-        const activeIdx =
-          typeof hl.activeElementIndex === 'number' ? hl.activeElementIndex : null;
+      renderElements(hl.elements || [], typeof hl.activeElementIndex === 'number' ? hl.activeElementIndex : null, hl.combinedHumanReadable || hl.humanReadable);
+    }
 
-        const selectWrapper = document.createElement('div');
-        selectWrapper.className = 'select-wrapper elements-select-wrapper';
-
-        const selectEl = document.createElement('select');
-        selectEl.className = 'select-box elements-select';
-        selectEl.id = 'elements-select';
-        selectEl.title = 'Select match to highlight and scroll in browser';
-
-        const allOpt = document.createElement('option');
-        allOpt.value = '';
-        allOpt.textContent = 'All matches (' + els.length + ') — highlight all';
-        selectEl.appendChild(allOpt);
-
-        els.forEach((el) => {
-          const opt = document.createElement('option');
-          opt.value = String(el.index);
-          opt.textContent = formatElementSummaryText(el, els.length);
-          selectEl.appendChild(opt);
-        });
-
-        selectEl.value = activeIdx !== null ? String(activeIdx) : '';
-        selectEl.addEventListener('change', () => {
-          const val = selectEl.value;
-          const nextIdx = val === '' ? null : Number(val);
-          vscode.postMessage({ type: 'focusElement', index: nextIdx });
-        });
-
-        const selectArrow = document.createElement('span');
-        selectArrow.className = 'select-arrow';
-        selectArrow.textContent = '▾';
-
-        selectWrapper.appendChild(selectEl);
-        selectWrapper.appendChild(selectArrow);
-        elementsList.appendChild(selectWrapper);
-
-        const prevBtn = document.createElement('button');
-        prevBtn.className = 'nav-chip';
-        prevBtn.id = 'btn-prev-element';
-        prevBtn.textContent = '‹';
-        prevBtn.title = 'Previous element';
-        prevBtn.addEventListener('click', () => {
-          const nextIdx =
-            activeIdx === null
-              ? els.length - 1
-              : (activeIdx - 1 + els.length) % els.length;
-          vscode.postMessage({ type: 'focusElement', index: nextIdx });
-        });
-        elementsList.appendChild(prevBtn);
-
-        const nextBtn = document.createElement('button');
-        nextBtn.className = 'nav-chip';
-        nextBtn.id = 'btn-next-element';
-        nextBtn.textContent = '›';
-        nextBtn.title = 'Next element';
-        nextBtn.addEventListener('click', () => {
-          const nextIdx =
-            activeIdx === null ? 0 : (activeIdx + 1) % els.length;
-          vscode.postMessage({ type: 'focusElement', index: nextIdx });
-        });
-        elementsList.appendChild(nextBtn);
-      } else {
-        elementsRow.style.display = 'none';
+    function renderElements(els, activeIdx, locatorText) {
+      elementsButton.disabled = !els.length;
+      if (!els.length) {
+        elementsSelect.close();
+        elementsSelect.update([], '');
+        return;
       }
+
+      const options = [
+        { value: '', label: 'All matches (' + els.length + ') — highlight all' },
+        ...els.map((el) => ({
+          value: String(el.index),
+          label: formatElementSummaryText(el),
+          title: locatorText ? locatorText + '.nth(' + el.index + ')' : undefined,
+        })),
+      ];
+      elementsSelect.update(options, activeIdx === null ? '' : String(activeIdx));
+    }
+
+    function updateScreen() {
+      const showFrame = !navigationLoading && pageReady && Boolean(currentUrl) && screenImg.hasAttribute('src');
+      const waitingText = currentUrl ? 'Waiting for page' : 'Waiting for navigation';
+      if (placeholder.textContent !== waitingText) placeholder.textContent = waitingText;
+      placeholder.hidden = showFrame || navigationLoading;
+      pageSpinner.hidden = !navigationLoading;
+      screenImg.style.display = showFrame ? 'block' : 'none';
+    }
+
+    function updateNavigationState(st) {
+      if (resettingUrl) {
+        if (st.currentUrl !== 'about:blank' || st.navigationLoading) return;
+        resettingUrl = false;
+        hasUrlDraft = Boolean(urlInput.value.trim());
+      }
+      navigationLoading = st.navigationLoading === true;
+      const previousUrl = currentUrl;
+      currentUrl = st.currentUrl === 'about:blank' ? '' : (st.currentUrl || '');
+      const ready = st.pageReady === true;
+      if (pageReady && !ready) screenImg.removeAttribute('src');
+      pageReady = ready;
+      if (currentUrl) hasNavigated = true;
+      navigation.classList.toggle('is-new', !hasNavigated);
+      showNavigationError(st.navigationError || '');
+
+      if (submittedUrl) {
+        if (st.navigationError) submittedUrl = '';
+        else if (!pageReady) navigationWasPending = true;
+        else if (currentUrl && (navigationWasPending || currentUrl !== previousUrl || currentUrl === submittedUrl)) {
+          hasUrlDraft = false;
+          submittedUrl = '';
+        }
+      }
+      if (pageReady && currentUrl && !hasUrlDraft && !st.navigationError && urlInput.value !== currentUrl) {
+        urlInput.value = currentUrl;
+      }
+      updateScreen();
     }
 
     window.addEventListener('message', (event) => {
@@ -1305,46 +1712,38 @@ export class BrowserWebviewPanel {
 
       if (msg.type === 'screencastFrame') {
         const { data, deviceWidth, deviceHeight, pageUrl } = msg.payload;
+        if (resettingUrl || pageUrl === 'about:blank') return;
         if (deviceWidth && deviceHeight) {
           viewportWidth = deviceWidth;
           viewportHeight = deviceHeight;
         }
-        placeholder.style.display = 'none';
-        screenImg.style.display = 'block';
         screenImg.src = 'data:image/jpeg;base64,' + data;
-        if (pageUrl && document.activeElement !== urlInput) {
-          urlInput.value = pageUrl;
-        }
+        updateScreen();
+      } else if (msg.type === 'navigationHistory') {
+        renderNavigationHistory(msg.payload.urls);
       } else if (msg.type === 'state') {
         const st = msg.payload;
-        if (st.currentUrl && document.activeElement !== urlInput && st.currentUrl !== 'about:blank') {
-          urlInput.value = st.currentUrl;
-        }
+        updateNavigationState(st);
         if (st.viewport) {
           viewportWidth = st.viewport.width;
           viewportHeight = st.viewport.height;
           const vpKey = st.viewport.width + 'x' + st.viewport.height;
-          if ([...viewportSelect.options].some((o) => o.value === vpKey)) {
-            viewportSelect.value = vpKey;
-          }
+          const options = viewportOptions.some((option) => option.value === vpKey)
+            ? viewportOptions
+            : [...viewportOptions, { value: vpKey, label: st.viewport.width + '×' + st.viewport.height }];
+          viewportSelect.update(options, vpKey);
         }
         if (Array.isArray(st.availableStorageStates)) {
           const currentVal = st.storageStatePath || '';
-          storageSelect.innerHTML = '<option value="">No auth (clean session)</option>';
-          st.availableStorageStates.forEach((cand) => {
-            const opt = document.createElement('option');
-            opt.value = cand.fullPath;
-            opt.textContent = cand.label;
-            opt.title = cand.relativePath + ' (cookies: ' + cand.cookiesCount + ', origins: ' + cand.originsCount + ')';
-            storageSelect.appendChild(opt);
-          });
-          if (currentVal && ![...storageSelect.options].some((o) => o.value === currentVal)) {
-            const customOpt = document.createElement('option');
-            customOpt.value = currentVal;
-            customOpt.textContent = currentVal.split(/[\\/]/).slice(-2).join('/');
-            storageSelect.appendChild(customOpt);
+          const options = [noAuthOption, ...st.availableStorageStates.map((cand) => ({
+            value: cand.fullPath,
+            label: cand.label,
+            title: cand.relativePath + ' (cookies: ' + cand.cookiesCount + ', origins: ' + cand.originsCount + ')',
+          }))];
+          if (currentVal && !options.some((option) => option.value === currentVal)) {
+            options.push({ value: currentVal, label: currentVal.split(/[\\/]/).slice(-2).join('/'), title: currentVal });
           }
-          storageSelect.value = currentVal;
+          storageSelect.update(options, currentVal);
         }
         renderHighlight(st.lastHighlight);
       } else if (msg.type === 'highlightResult') {
@@ -1354,6 +1753,7 @@ export class BrowserWebviewPanel {
         locatorSearchInput.value = text;
         autoResizeLocatorInput();
       } else if (msg.type === 'searchError') {
+        if (!pageReady) return;
         const errText = (msg.payload && msg.payload.message) || 'Failed to parse locator';
         locatorStatus.textContent = errText;
         locatorStatus.className = 'badge badge-zero';

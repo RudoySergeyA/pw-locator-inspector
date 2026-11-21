@@ -50,7 +50,15 @@ export interface LocatorStep {
 export interface LocatorDescriptor {
   steps: LocatorStep[];
   humanReadable: string;
+  /** Отдельные цепочки, объединённые этим дескриптором. */
+  iterations?: LocatorDescriptor[];
 }
+
+export class StaticForResolutionError extends Error {}
+
+const MAX_STATIC_FOR_ITERATIONS = 100;
+const MISSING_LOOP_VALUE = 'static for: missing value';
+class LoopEvaluation extends Set<string> {}
 
 export interface LocatorVariant {
   id: string;
@@ -359,6 +367,7 @@ function astValueToSerializedArg(
   unresolvedParams: Set<string>
 ): SerializedArg {
   if (!val) {
+    if (unresolvedParams instanceof LoopEvaluation) unresolvedParams.add(MISSING_LOOP_VALUE);
     return undefined;
   }
   switch (val.kind) {
@@ -1502,13 +1511,19 @@ class FileLocatorAnalyzer {
             );
             if (val) {
               properties.set(key, val);
+            } else if (unresolvedParams instanceof LoopEvaluation) {
+              unresolvedParams.add(MISSING_LOOP_VALUE);
             }
+          } else if (unresolvedParams instanceof LoopEvaluation) {
+            unresolvedParams.add(MISSING_LOOP_VALUE);
           }
         } else if (ts.isShorthandPropertyAssignment(prop)) {
           const key = prop.name.text;
           const val = lookupEnv(env, key);
           if (val) {
             properties.set(key, val);
+          } else if (unresolvedParams instanceof LoopEvaluation) {
+            unresolvedParams.add(MISSING_LOOP_VALUE);
           }
         } else if (ts.isSpreadAssignment(prop)) {
           const spreadVal = this.evaluateNode(prop.expression, env, unresolvedParams);
@@ -1516,7 +1531,11 @@ class FileLocatorAnalyzer {
             for (const [k, v] of spreadVal.properties.entries()) {
               properties.set(k, v);
             }
+          } else if (unresolvedParams instanceof LoopEvaluation) {
+            unresolvedParams.add(MISSING_LOOP_VALUE);
           }
+        } else if (unresolvedParams instanceof LoopEvaluation) {
+          unresolvedParams.add(MISSING_LOOP_VALUE);
         }
       }
       return { kind: 'object', properties };
@@ -1533,6 +1552,9 @@ class FileLocatorAnalyzer {
     if (ts.isPropertyAccessExpression(node)) {
       const base = this.evaluateNode(node.expression, env, unresolvedParams);
       const propName = node.name.text;
+      if (base?.kind === 'array' && propName === 'length') {
+        return { kind: 'primitive', value: base.elements.length };
+      }
       if (
         base?.kind === 'locator' &&
         (propName === 'not' ||
@@ -1847,6 +1869,108 @@ class FileLocatorAnalyzer {
       cur = cur.parent;
     }
     return cloneEnv(this.rootEnv);
+  }
+
+  public resolveForLocator(node: ts.Node, overrides?: Record<string, SerializedArg>): LocatorDescriptor | undefined {
+    if (ts.isIdentifier(node) && ts.isVariableDeclaration(node.parent) && node.parent.name === node && node.parent.initializer) {
+      node = node.parent.initializer;
+    }
+    const pathToNode: ts.Node[] = [node];
+    let outerLoop: ts.ForStatement | undefined;
+    for (let child = node; child.parent; child = child.parent) {
+      const parent = child.parent;
+      if (ts.isFunctionLike(parent)) break;
+      if (ts.isForStatement(parent) && parent.statement === child) outerLoop = parent;
+      pathToNode.unshift(parent);
+    }
+    if (!outerLoop) return undefined;
+
+    const outerIndex = pathToNode.indexOf(outerLoop);
+    const scope = this.findScopeForNode(outerLoop);
+    for (const [name, value] of Object.entries(overrides ?? {})) {
+      scope.vars.set(name, serializedArgToAstValue(value));
+    }
+    let scopes = [scope];
+    let remaining = MAX_STATIC_FOR_ITERATIONS;
+    for (let p = Math.max(0, outerIndex - 1); p < pathToNode.length - 1; p++) {
+      const parent = pathToNode[p];
+      const child = pathToNode[p + 1];
+      if (ts.isBlock(parent)) {
+        scopes = scopes.map((env) => {
+          const block = createEnv(env);
+          for (const stmt of parent.statements) {
+            if (stmt === child) break;
+            if (!ts.isVariableStatement(stmt)) continue;
+            for (const decl of stmt.declarationList.declarations) {
+              if (!ts.isIdentifier(decl.name)) continue;
+              const unresolved = new LoopEvaluation();
+              const value = stmt.declarationList.flags & ts.NodeFlags.Const
+                ? this.evaluateNode(decl.initializer, block, unresolved)
+                : undefined;
+              block.vars.set(decl.name.text, value && !unresolved.size ? value : { kind: 'unresolvedParam', paramName: decl.name.text });
+            }
+          }
+          return block;
+        });
+      } else if (ts.isForStatement(parent) && parent.statement === child) {
+        const init = parent.initializer;
+        const decl = init && ts.isVariableDeclarationList(init) && init.declarations.length === 1 ? init.declarations[0] : undefined;
+        const condition = parent.condition;
+        const update = parent.incrementor;
+        const invalid = () => new StaticForResolutionError('Cannot statically resolve the for loop. Expected an integer counter with a known bound and ++ or --.');
+        if (!decl || !ts.isIdentifier(decl.name) || !condition || !ts.isBinaryExpression(condition) ||
+            !ts.isIdentifier(condition.left) || condition.left.text !== decl.name.text ||
+            !update || !(ts.isPrefixUnaryExpression(update) || ts.isPostfixUnaryExpression(update)) ||
+            !ts.isIdentifier(update.operand) || update.operand.text !== decl.name.text) throw invalid();
+        const name = decl.name.text;
+        const delta = update.operator === ts.SyntaxKind.PlusPlusToken ? 1 : update.operator === ts.SyntaxKind.MinusMinusToken ? -1 : 0;
+        const op = condition.operatorToken.kind;
+        if (!(delta === 1 && (op === ts.SyntaxKind.LessThanToken || op === ts.SyntaxKind.LessThanEqualsToken)) &&
+            !(delta === -1 && (op === ts.SyntaxKind.GreaterThanToken || op === ts.SyntaxKind.GreaterThanEqualsToken))) throw invalid();
+        const unsafeBody = (n: ts.Node): boolean => {
+          if (ts.isFunctionLike(n)) return false;
+          if (ts.isBreakStatement(n) || ts.isContinueStatement(n) || ts.isReturnStatement(n) || ts.isThrowStatement(n)) return true;
+          if ((ts.isPrefixUnaryExpression(n) || ts.isPostfixUnaryExpression(n)) &&
+              (n.operator === ts.SyntaxKind.PlusPlusToken || n.operator === ts.SyntaxKind.MinusMinusToken) &&
+              ts.isIdentifier(n.operand) && n.operand.text === name) return true;
+          if (ts.isBinaryExpression(n) && n.operatorToken.kind >= ts.SyntaxKind.FirstAssignment &&
+              n.operatorToken.kind <= ts.SyntaxKind.LastAssignment && ts.isIdentifier(n.left) && n.left.text === name) return true;
+          return ts.forEachChild(n, unsafeBody) === true;
+        };
+        if (unsafeBody(parent.statement)) throw invalid();
+        scopes = scopes.flatMap((env) => {
+          const unresolved = new LoopEvaluation();
+          const start = this.evaluateNode(decl.initializer, env, unresolved);
+          const end = this.evaluateNode(condition.right, env, unresolved);
+          if (unresolved.size || start?.kind !== 'primitive' || typeof start.value !== 'number' || !Number.isSafeInteger(start.value) ||
+              end?.kind !== 'primitive' || typeof end.value !== 'number' || !Number.isSafeInteger(end.value)) throw invalid();
+          const inclusive = op === ts.SyntaxKind.LessThanEqualsToken || op === ts.SyntaxKind.GreaterThanEqualsToken;
+          const length = Math.max(0, (end.value - start.value) * delta + Number(inclusive));
+          if (length > remaining) throw new StaticForResolutionError(`Static for loop exceeds ${MAX_STATIC_FOR_ITERATIONS} iterations.`);
+          remaining -= length;
+          const startValue = start.value;
+          return Array.from({ length }, (_, i) => {
+            const iteration = createEnv(env);
+            iteration.vars.set(name, { kind: 'primitive', value: startValue + i * delta });
+            return iteration;
+          });
+        });
+      }
+    }
+    if (!scopes.length) throw new StaticForResolutionError('The for loop has no iterations.');
+    const iterations = scopes.map((env) => {
+      const unresolved = new LoopEvaluation();
+      const value = this.evaluateNode(node, env, unresolved);
+      if (value?.kind !== 'locator' || unresolved.size) {
+        throw new StaticForResolutionError('Cannot resolve all locator arguments inside the for loop.');
+      }
+      return value.descriptor;
+    });
+    const unique = [...new Map(iterations.map((item) => [item.humanReadable, item])).values()];
+    const steps: LocatorStep[] = [...unique[0].steps, ...unique.slice(1).map((descriptor): LocatorStep => ({
+      method: 'or', args: [{ __kind: 'locator', descriptor }],
+    }))];
+    return { steps, humanReadable: formatLocatorSteps(steps), iterations };
   }
 
   public getRecordedCalls(fnNode: ts.Node): FunctionCallRecord[] {
@@ -2650,6 +2774,15 @@ function buildResultFromCandidate(
       .replace(/\s+/g, ' ')
       .trim();
 
+  const loopDescriptor = analyzer.resolveForLocator(candidate.locatorExprNode, parameterOverrides);
+  if (loopDescriptor) {
+    return {
+      expressionText, range, activeLineRanges,
+      strippedActionMethod: candidate.strippedActionMethod,
+      descriptor: loopDescriptor,
+      requiresParameterSelection: false, parameterNames: [], variants: [],
+    };
+  }
   const baseScope = analyzer.findScopeForNode(candidate.locatorExprNode);
   const callable = candidate.enclosingParamCallable;
 

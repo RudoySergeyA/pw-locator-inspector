@@ -9,6 +9,7 @@ import {
   resolveLocatorAtPosition,
   resolveLocatorFromSnippet,
   SerializedArg,
+  StaticForResolutionError,
 } from './locatorAstResolver';
 import { BrowserWebviewPanel } from './webviewPanel';
 
@@ -269,7 +270,7 @@ export function activate(context: vscode.ExtensionContext): void {
     targetEditor?: vscode.TextEditor
   ): Promise<void> => {
     const epoch = ++gutterScanEpoch;
-    if (!browserManager || !BrowserWebviewPanel.isOpen()) {
+    if (!browserManager?.isPageReady() || !BrowserWebviewPanel.isOpen()) {
       clearAllGutterDecorations();
       return;
     }
@@ -568,7 +569,6 @@ export function activate(context: vscode.ExtensionContext): void {
     const workspaceRoot = workspaceFolder?.uri.fsPath;
 
     const cfg = vscode.workspace.getConfiguration('pwLocatorInspector');
-    const defaultUrl = cfg.get<string>('defaultUrl') || undefined;
     const rawStorageState = cfg.get<string>('storageStatePath') || '';
     const storageStatePath =
       rawStorageState && workspaceRoot && !path.isAbsolute(rawStorageState)
@@ -576,13 +576,14 @@ export function activate(context: vscode.ExtensionContext): void {
         : rawStorageState || undefined;
     const width = cfg.get<number>('viewportWidth') || 1440;
     const height = cfg.get<number>('viewportHeight') || 900;
+    const readEnvFiles = cfg.get<boolean>('readEnvFiles') ?? false;
 
     return {
       activeFilePath,
       workspaceRoot,
-      initialUrl: defaultUrl,
       storageStatePath,
       viewport: { width, height },
+      readEnvFiles,
       onSearchLocatorSnippet: (snippet: string) =>
         handleSearchLocatorSnippet(snippet),
       onSelectParameterVariant: (variantId: string) =>
@@ -790,6 +791,27 @@ export function activate(context: vscode.ExtensionContext): void {
   ): ResolvedLocatorResult => {
     const hasSelection = Boolean(sel && !sel.isEmpty);
     if (hasSelection && sel) {
+      const selection = {
+        startLine: sel.start.line + 1,
+        startColumn: sel.start.character + 1,
+        endLine: sel.end.line + 1,
+        endColumn: sel.end.character + 1,
+      };
+      const resolveInFile = () => resolveLocatorAtPosition({
+        filePath: doc.uri.fsPath,
+        sourceText: doc.getText(),
+        line: pos.line + 1,
+        column: pos.character + 1,
+        selection,
+        parameterOverrides,
+      });
+      let positional: ResolvedLocatorResult | undefined;
+      try {
+        positional = resolveInFile();
+        if (positional.descriptor?.iterations) return positional;
+      } catch (err) {
+        if (err instanceof StaticForResolutionError) throw err;
+      }
       const selectedText = doc.getText(sel).trim();
       // 1. Сначала пробуем разрезолвить ровно выделенный фрагмент кода как самостоятельный сниппет
       if (selectedText.length >= 3) {
@@ -822,19 +844,7 @@ export function activate(context: vscode.ExtensionContext): void {
         }
       }
 
-      return resolveLocatorAtPosition({
-        filePath: doc.uri.fsPath,
-        sourceText: doc.getText(),
-        line: pos.line + 1,
-        column: pos.character + 1,
-        selection: {
-          startLine: sel.start.line + 1,
-          startColumn: sel.start.character + 1,
-          endLine: sel.end.line + 1,
-          endColumn: sel.end.character + 1,
-        },
-        parameterOverrides,
-      });
+      return positional ?? resolveInFile();
     }
 
     return resolveLocatorAtPosition({
@@ -965,10 +975,10 @@ export function activate(context: vscode.ExtensionContext): void {
   // Silent DOM probe & soft inline badge on selection
   let selectionProbeTimer: ReturnType<typeof setTimeout> | undefined;
   let selectionProbeSeq = 0;
+  let selectedLocatorEditor: vscode.TextEditor | undefined;
 
-  context.subscriptions.push(
-    vscode.window.onDidChangeTextEditorSelection((e) => {
-      const editor = e.textEditor;
+  const scheduleSelectionProbe =
+    (editor: vscode.TextEditor): void => {
       if (!isCodeDocument(editor.document)) {
         return;
       }
@@ -1032,12 +1042,7 @@ export function activate(context: vscode.ExtensionContext): void {
               return;
             }
             if (!firstProbe.browserReady) {
-              setHoverInlineBadge(
-                editor.document.uri,
-                targetLine,
-                'Inspector browser is closed',
-                'idle'
-              );
+              editor.setDecorations(hoverInlineBadgeDecorationType, []);
               return;
             }
             let matched = 0;
@@ -1080,12 +1085,7 @@ export function activate(context: vscode.ExtensionContext): void {
           }
 
           if (!probe.browserReady) {
-            setHoverInlineBadge(
-              editor.document.uri,
-              targetLine,
-              'Inspector browser is closed',
-              'idle'
-            );
+            editor.setDecorations(hoverInlineBadgeDecorationType, []);
           } else if (probe.count > 0) {
             setHoverInlineBadge(
               editor.document.uri,
@@ -1102,9 +1102,58 @@ export function activate(context: vscode.ExtensionContext): void {
             );
           }
         } catch {
-          editor.setDecorations(hoverInlineBadgeDecorationType, []);
+          if (seq === selectionProbeSeq) {
+            editor.setDecorations(hoverInlineBadgeDecorationType, []);
+          }
         }
       }, 160);
+    };
+
+  const refreshSelectedLocator = (): void => {
+    if (!BrowserWebviewPanel.isOpen()) {
+      return;
+    }
+    const editor = selectedLocatorEditor;
+    if (editor && vscode.window.visibleTextEditors.includes(editor) && !editor.selection.isEmpty) {
+      scheduleSelectionProbe(editor);
+    }
+  };
+
+  const refreshForPageChange = (delay: number): void => {
+    if (BrowserWebviewPanel.isOpen()) {
+      const editor = selectedLocatorEditor;
+      scheduleGutterScan(delay, editor && vscode.window.visibleTextEditors.includes(editor) ? editor : undefined);
+      refreshSelectedLocator();
+    }
+  };
+  const onViewportChanged = () => refreshForPageChange(250);
+  const onDomChanged = () => refreshForPageChange(50);
+  browserManager.on('viewportChanged', onViewportChanged);
+  browserManager.on('domChanged', onDomChanged);
+
+  const selectionRefreshEvents = ['browserReady', 'pageNavigated', 'highlightChanged'];
+  for (const event of selectionRefreshEvents) {
+    browserManager.on(event, refreshSelectedLocator);
+  }
+  context.subscriptions.push(
+    vscode.window.onDidChangeTextEditorSelection(({ textEditor }) => {
+      if (isCodeDocument(textEditor.document)) {
+        if (!textEditor.selection.isEmpty) {
+          selectedLocatorEditor = textEditor;
+        } else if (selectedLocatorEditor === textEditor) {
+          selectedLocatorEditor = undefined;
+        }
+      }
+      scheduleSelectionProbe(textEditor);
+    }),
+    new vscode.Disposable(() => {
+      browserManager?.off('viewportChanged', onViewportChanged);
+      browserManager?.off('domChanged', onDomChanged);
+      for (const event of selectionRefreshEvents) {
+        browserManager?.off(event, refreshSelectedLocator);
+      }
+      selectionProbeSeq += 1;
+      clearTimeout(selectionProbeTimer);
     })
   );
 

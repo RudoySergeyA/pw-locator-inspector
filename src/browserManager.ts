@@ -20,6 +20,7 @@ export interface HighlightedElementInfo {
   nameAttr: string;
   typeAttr: string;
   textPreview: string;
+  imageAlt?: string;
   valuePreview: string;
   visible: boolean;
   rect: {
@@ -51,8 +52,10 @@ export interface HighlightLocatorResult {
   visibleCount: number;
   elements: HighlightedElementInfo[];
   statusText: string;
+  waitingForPage?: boolean;
   expressionText: string;
   humanReadable: string;
+  combinedHumanReadable?: string;
   strippedActionMethod?: string;
   activeElementIndex?: number | null;
   parameterInfo?: HighlightParameterInfo;
@@ -69,6 +72,9 @@ export interface ScreencastFramePayload {
 export interface BrowserStateSnapshot {
   isRunning: boolean;
   currentUrl: string;
+  pageReady: boolean;
+  navigationLoading: boolean;
+  navigationError?: string;
   pageTitle: string;
   viewport: { width: number; height: number };
   storageStatePath: string;
@@ -103,7 +109,23 @@ export class BrowserManager extends EventEmitter {
 
   private viewport = { width: 1440, height: 900 };
   private storageStatePath = '';
+  private readEnvFiles = false;
   private currentUrl = 'about:blank';
+  private pageReady = false;
+  private pendingNavigationRequest?: object;
+  private navigationError?: string;
+  private explicitNavigation?: object;
+  private closing?: Promise<void>;
+
+  public isPageReady(): boolean {
+    return this.pageReady && Boolean(this.page && !this.page.isClosed());
+  }
+
+  private publishVisit(...urls: string[]): void {
+    if (this.runtime) {
+      this.emit('navigationVisited', this.runtime.projectRoot, urls);
+    }
+  }
   private pageTitle = '';
   private isScreencastActive = false;
   private frameInFlight = false;
@@ -115,6 +137,7 @@ export class BrowserManager extends EventEmitter {
     parameterInfo?: HighlightParameterInfo;
   };
   private searchEpoch = 0;
+  private domChangeTimer?: ReturnType<typeof setTimeout>;
   private navigationRehighlightTimer?: ReturnType<typeof setTimeout>;
   private navigationRetryTimer?: ReturnType<typeof setTimeout>;
 
@@ -194,14 +217,36 @@ export class BrowserManager extends EventEmitter {
     initialUrl?: string;
     storageStatePath?: string;
     viewport?: { width: number; height: number };
+    readEnvFiles?: boolean;
   }): Promise<BrowserStateSnapshot> {
-    if (!this.runtime || options?.activeFilePath || options?.workspaceRoot) {
+    await this.closing;
+    const requestedReadEnv =
+      options?.readEnvFiles !== undefined
+        ? Boolean(options.readEnvFiles)
+        : this.readEnvFiles;
+
+    if (
+      !this.runtime ||
+      options?.activeFilePath ||
+      options?.workspaceRoot ||
+      requestedReadEnv !== this.readEnvFiles
+    ) {
       const nextRuntime = resolveWorkspacePlaywright(
         options?.activeFilePath,
-        options?.workspaceRoot
+        options?.workspaceRoot,
+        { readEnvFiles: requestedReadEnv }
       );
-      if (!this.runtime || this.runtime.projectRoot !== nextRuntime.projectRoot) {
+      if (
+        !this.runtime ||
+        this.runtime.projectRoot !== nextRuntime.projectRoot ||
+        requestedReadEnv !== this.readEnvFiles
+      ) {
+        if (this.runtime && this.runtime.projectRoot !== nextRuntime.projectRoot) {
+          await this.dispose();
+          this.storageStatePath = '';
+        }
         this.runtime = nextRuntime;
+        this.readEnvFiles = requestedReadEnv;
         this.viewport = options?.viewport || { ...nextRuntime.config.viewport };
         if (options?.storageStatePath !== undefined) {
           this.storageStatePath = options.storageStatePath;
@@ -244,7 +289,11 @@ export class BrowserManager extends EventEmitter {
       await this.navigate(options.initialUrl);
     }
 
-    return this.getStateSnapshot();
+    const state = this.getStateSnapshot();
+    if (state.isRunning) {
+      this.emit('browserReady');
+    }
+    return state;
   }
 
   private async recreateContextAndPage(targetUrl?: string): Promise<void> {
@@ -270,10 +319,6 @@ export class BrowserManager extends EventEmitter {
       },
     };
 
-    if (this.runtime.config.extraHTTPHeaders) {
-      contextOptions.extraHTTPHeaders = this.runtime.config.extraHTTPHeaders;
-    }
-
     if (this.storageStatePath) {
       const check = isValidPlaywrightStorageStateFile(this.storageStatePath);
       if (check.valid) {
@@ -284,13 +329,115 @@ export class BrowserManager extends EventEmitter {
     }
 
     this.context = await this.browser.newContext(contextOptions);
+
+    // Безопасные extraHTTPHeaders подставляем строго на same-origin целевого baseURL,
+    // чтобы заголовки никогда не утекали на сторонние домены и CDN.
+    if (
+      this.runtime.config.extraHTTPHeaders &&
+      Object.keys(this.runtime.config.extraHTTPHeaders).length > 0 &&
+      this.runtime.config.baseURL
+    ) {
+      try {
+        const allowedOrigin = new URL(this.runtime.config.baseURL).origin;
+        const extraHeaders = { ...this.runtime.config.extraHTTPHeaders };
+        await this.context.route(
+          (url: URL) => {
+            try {
+              return new URL(String(url)).origin === allowedOrigin;
+            } catch {
+              return false;
+            }
+          },
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          async (route: any) => {
+            try {
+              const mergedHeaders = {
+                ...route.request().headers(),
+                ...extraHeaders,
+              };
+              await route.continue({ headers: mergedHeaders });
+            } catch {
+              await route.continue().catch(() => undefined);
+            }
+          }
+        );
+      } catch {
+        // Если baseURL некорректен — не подставляем extraHTTPHeaders
+      }
+    }
+
+    await this.context.exposeBinding('__pwLocatorInspectorDomChanged', ({ page }: { page: unknown }) => {
+      if (page === this.page && this.isPageReady() && !this.domChangeTimer) {
+        this.domChangeTimer = setTimeout(() => {
+          this.domChangeTimer = undefined;
+          if (page === this.page && this.isPageReady()) this.emit('domChanged');
+        }, 220);
+      }
+    });
+    await this.context.addInitScript(() => {
+      const notify = (globalThis as unknown as { __pwLocatorInspectorDomChanged: () => Promise<void> }).__pwLocatorInspectorDomChanged;
+      const isOverlay = (node: Node): boolean => {
+        const element = node instanceof Element ? node : node.parentElement;
+        return Boolean(element?.closest('#__pw_locator_inspector_overlay__, x-pw-glass'));
+      };
+      let pending = false;
+      new MutationObserver((records) => {
+        if (pending || !records.some((record) => {
+          if (isOverlay(record.target)) return false;
+          return record.type !== 'childList' ||
+            [...Array.from(record.addedNodes), ...Array.from(record.removedNodes)].some((node) => !isOverlay(node));
+        })) return;
+        pending = true;
+        setTimeout(() => {
+          pending = false;
+          void notify().catch(() => undefined);
+        }, 120);
+      }).observe(document, { subtree: true, childList: true, attributes: true, characterData: true });
+    });
     this.page = await this.context.newPage();
+    this.pageReady = false;
+    const page = this.page;
+    let navigationStatus: number | undefined;
+    type NavigationRequest = { isNavigationRequest(): boolean; frame(): unknown };
+    const isMainNavigation = (request: NavigationRequest): boolean => {
+      try {
+        return page === this.page && request.isNavigationRequest() && request.frame() === page.mainFrame();
+      } catch {
+        return false;
+      }
+    };
+    page.on('request', (request: NavigationRequest) => {
+      if (isMainNavigation(request)) {
+        this.pendingNavigationRequest = request;
+        navigationStatus = undefined;
+        this.pageReady = false;
+        this.navigationError = undefined;
+        this.emit('pageNavigated', this.currentUrl);
+        this.emit('stateChanged', this.getStateSnapshot());
+      }
+    });
+    page.on('response', (response: { request(): NavigationRequest; status(): number }) => {
+      if (isMainNavigation(response.request())) {
+        navigationStatus = response.status();
+      }
+    });
+    page.on('requestfailed', (request: NavigationRequest) => {
+      if (page !== this.page || request !== this.pendingNavigationRequest) return;
+      this.pendingNavigationRequest = undefined;
+      if (!this.explicitNavigation) {
+        this.navigationError = 'Could not open the page.';
+        this.emit('stateChanged', this.getStateSnapshot());
+      }
+    });
 
     this.page.on('framenavigated', async (frame: { parentFrame: () => unknown; url: () => string }) => {
       if (!frame.parentFrame()) {
         const nextUrl = frame.url();
         const urlChanged = nextUrl !== this.currentUrl;
         this.currentUrl = nextUrl;
+        if (urlChanged && this.isPageReady() && !this.explicitNavigation) {
+          this.publishVisit(nextUrl);
+        }
         try {
           this.pageTitle = await this.page.title();
         } catch {
@@ -308,9 +455,28 @@ export class BrowserManager extends EventEmitter {
       }
     });
 
-    this.page.on('load', async () => {
+    page.on('domcontentloaded', async () => {
+      if (page !== this.page) return;
+      this.pendingNavigationRequest = undefined;
+      if (this.explicitNavigation) return;
+      this.currentUrl = page.url();
+      this.pageReady = /^https?:\/\//i.test(this.currentUrl) && (navigationStatus === undefined || navigationStatus < 400);
+      this.navigationError = navigationStatus !== undefined && navigationStatus >= 400
+        ? `Could not open the page (HTTP ${navigationStatus}).`
+        : undefined;
+      if (this.pageReady) {
+        this.publishVisit(this.currentUrl);
+      }
+      this.emit('pageNavigated', this.currentUrl);
+      this.emit('stateChanged', this.getStateSnapshot());
+    });
+
+    page.on('load', async () => {
+      if (page !== this.page) {
+        return;
+      }
       try {
-        this.currentUrl = this.page.url();
+        this.currentUrl = page.url();
         this.pageTitle = await this.page.title();
       } catch {
         // ignore
@@ -324,11 +490,7 @@ export class BrowserManager extends EventEmitter {
 
     await this.startScreencast();
 
-    const urlToOpen =
-      targetUrl ||
-      (this.currentUrl !== 'about:blank'
-        ? this.currentUrl
-        : this.runtime.config.baseURL || '');
+    const urlToOpen = targetUrl;
 
     if (urlToOpen && urlToOpen !== 'about:blank') {
       await this.navigate(urlToOpen);
@@ -375,6 +537,7 @@ export class BrowserManager extends EventEmitter {
             // и автоматически перезапускаем поиск активного локатора на новой странице
             if (liveUrl && liveUrl !== this.currentUrl) {
               this.currentUrl = liveUrl;
+              if (this.isPageReady() && !this.explicitNavigation) this.publishVisit(liveUrl);
               if (this.lastHighlight) {
                 this.lastHighlight = undefined;
                 await this.clearHighlight();
@@ -447,10 +610,35 @@ export class BrowserManager extends EventEmitter {
       targetUrl = `https://${targetUrl}`;
     }
 
+    const page = this.page;
+    const navigation = {};
+    this.explicitNavigation = navigation;
+    this.navigationError = undefined;
+    this.pageReady = false;
     this.lastHighlight = undefined;
-    await this.clearHighlight();
-    await this.page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
-    this.currentUrl = this.page.url();
+    this.emit('pageNavigated', this.currentUrl);
+    this.emit('stateChanged', this.getStateSnapshot());
+    try {
+      await this.clearHighlight();
+      const response = await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+      if (this.explicitNavigation !== navigation || page !== this.page) return;
+      this.currentUrl = page.url();
+      if (response && response.status() >= 400) {
+        this.navigationError = `Could not open the page (HTTP ${response.status()}).`;
+      } else if (/^https?:\/\//i.test(this.currentUrl)) {
+        this.pageReady = true;
+        this.publishVisit(targetUrl, this.currentUrl);
+      }
+    } catch {
+      if (this.explicitNavigation !== navigation || page !== this.page) return;
+      this.navigationError = 'Could not open the page. Check the URL and try again.';
+    } finally {
+      if (this.explicitNavigation === navigation) {
+        this.explicitNavigation = undefined;
+        this.pendingNavigationRequest = undefined;
+      }
+    }
+    if (page !== this.page) return;
     try {
       this.pageTitle = await this.page.title();
     } catch {
@@ -532,6 +720,8 @@ export class BrowserManager extends EventEmitter {
     await this.page.setViewportSize({ width, height });
     await this.stopScreencast();
     await this.startScreencast();
+    this.scheduleRehighlightAfterNavigation(150);
+    this.emit('viewportChanged');
     this.emit('stateChanged', this.getStateSnapshot());
   }
 
@@ -653,7 +843,7 @@ export class BrowserManager extends EventEmitter {
     descriptor: LocatorDescriptor
   ): Promise<ProbeLocatorCountResult> {
     if (
-      !this.page ||
+      !this.isPageReady() ||
       !this.runtime ||
       !this.browser ||
       !this.browser.isConnected?.() ||
@@ -783,23 +973,32 @@ export class BrowserManager extends EventEmitter {
       this.runtime.selectors.setTestIdAttribute(this.runtime.config.testIdAttribute);
     }
 
-    this.searchEpoch += 1;
+    const epoch = ++this.searchEpoch;
+    const page = this.page;
+    const isCurrent = () => epoch === this.searchEpoch && page === this.page;
+    const cancelled: HighlightLocatorResult = {
+      count: 0, visibleCount: 0, elements: [], statusText: 'Search cancelled',
+      expressionText: '', humanReadable: '',
+    };
     this.cancelScheduledRehighlight();
     this.lastDescriptor = descriptor;
     this.lastMeta = meta;
 
-    // Обязательно очищаем предыдущий оверлей и <x-pw-glass> ДО вычисления нового локатора
     await this.clearHighlight();
+    if (!isCurrent()) return cancelled;
 
-    const locator = materializeLocator(this.page, descriptor);
-    const count: number = await locator.count();
+    const waitingForPage = !this.isPageReady();
+    const locator = waitingForPage ? undefined : materializeLocator(page, descriptor);
+    const count: number = locator ? await locator.count() : 0;
+    if (!isCurrent()) return cancelled;
 
     if (count === 0) {
       const emptyResult: HighlightLocatorResult = {
         count: 0,
         visibleCount: 0,
         elements: [],
-        statusText: 'Found: 0 (not in DOM)',
+        statusText: waitingForPage ? 'Waiting for page' : 'Found: 0 (not in DOM)',
+        waitingForPage,
         expressionText: meta?.expressionText || descriptor.humanReadable,
         humanReadable: descriptor.humanReadable,
         strippedActionMethod: meta?.strippedActionMethod,
@@ -854,12 +1053,8 @@ export class BrowserManager extends EventEmitter {
       // ignore
     }
 
-    // Вызываем нативный highlight() Playwright (для конкретного элемента или всей выборки)
-    if (resolvedFocusIndex !== null) {
-      await locator.nth(resolvedFocusIndex).highlight().catch(() => undefined);
-    } else {
-      await locator.highlight().catch(() => undefined);
-    }
+    // Один оверлей: нативная подсветка добавляет вторую рамку и подпись.
+    if (!isCurrent()) return cancelled;
 
     const testIdAttrs = (this.runtime.config.testIdAttribute || 'data-testid')
       .split(',')
@@ -869,9 +1064,9 @@ export class BrowserManager extends EventEmitter {
     const elements: HighlightedElementInfo[] = await locator.evaluateAll(
       (
         nodes: unknown[],
-        overlayArgs: { exprLabel: string; focusIndex: number | null; testIdAttrs: string[] }
+        overlayArgs: { focusIndex: number | null; testIdAttrs: string[] }
       ) => {
-        const { exprLabel, focusIndex, testIdAttrs: attrs } = overlayArgs;
+        const { focusIndex, testIdAttrs: attrs } = overlayArgs;
         const win = globalThis as unknown as Record<string, any>;
         const doc = win.document;
 
@@ -906,40 +1101,7 @@ export class BrowserManager extends EventEmitter {
         ].join(';');
         doc.documentElement.appendChild(overlayRoot);
 
-        const banner = doc.createElement('x-pw-inspector-banner');
-        banner.style.cssText = [
-          'position: fixed',
-          'top: 12px',
-          'right: 12px',
-          'display: block',
-          'background: rgba(15, 23, 42, 0.92)',
-          'color: #f8fafc',
-          'border: 1.5px solid #38bdf8',
-          'border-radius: 8px',
-          'padding: 8px 12px',
-          'font: 600 12px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
-          'box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35)',
-          'max-width: 520px',
-          'word-break: break-all',
-          'pointer-events: none',
-        ].join(';');
-        banner.textContent =
-          focusIndex !== null
-            ? `Element #${focusIndex + 1} of ${nodes.length} • ${exprLabel}`
-            : `Found: ${nodes.length} • ${exprLabel}`;
-        overlayRoot.appendChild(banner);
-
-        const boxes: Array<{ el: any; boxEl: any; badgeEl: any; idx: number }> = [];
-
-        const describeElement = (el: any, idx: number) => {
-          const tag = String(el.tagName || '').toLowerCase();
-          const testId = getElTestId(el);
-          const role = el.getAttribute?.('role') || '';
-          const id = el.id ? `#${el.id}` : '';
-          const testIdPart = testId ? `[testId="${testId}"]` : '';
-          const rolePart = role ? `[role="${role}"]` : '';
-          return `#${idx + 1} <${tag}>${id}${testIdPart}${rolePart}`;
-        };
+        const boxes: Array<{ el: any; boxEl: any; badgeEl: any }> = [];
 
         nodes.forEach((rawNode, idx) => {
           if (focusIndex !== null && idx !== focusIndex) {
@@ -971,11 +1133,11 @@ export class BrowserManager extends EventEmitter {
             'box-shadow: 0 2px 6px rgba(0,0,0,0.3)',
             'pointer-events: none',
           ].join(';');
-          badgeEl.textContent = describeElement(el, idx);
+          badgeEl.textContent = String(idx + 1);
 
           overlayRoot.appendChild(boxEl);
           overlayRoot.appendChild(badgeEl);
-          boxes.push({ el, boxEl, badgeEl, idx });
+          boxes.push({ el, boxEl, badgeEl });
         });
 
         const initialHref = win.location?.href;
@@ -1073,6 +1235,7 @@ export class BrowserManager extends EventEmitter {
             nameAttr: String(el.getAttribute?.('name') || ''),
             typeAttr: String(el.getAttribute?.('type') || ''),
             textPreview: rawText.slice(0, 120),
+            imageAlt: String(el.getAttribute?.('alt') || '').slice(0, 120),
             valuePreview: rawVal.slice(0, 80),
             visible,
             rect: {
@@ -1085,18 +1248,31 @@ export class BrowserManager extends EventEmitter {
         });
       },
       {
-        exprLabel: meta?.expressionText || descriptor.humanReadable,
         focusIndex: resolvedFocusIndex,
         testIdAttrs,
       }
     );
 
+    if (!isCurrent()) return cancelled;
     const visibleCount = elements.filter((e) => e.visible).length;
     const strippedNote = meta?.strippedActionMethod
       ? ` [action .${meta.strippedActionMethod}() stripped]`
       : '';
 
     const statusText = `Found: ${count} (visible: ${visibleCount})${strippedNote}`;
+    let humanReadable = descriptor.humanReadable;
+    if (resolvedFocusIndex !== null && descriptor.iterations?.length) {
+      // DOM-порядок объединения не обязан совпадать с порядком итераций.
+      for (const iteration of descriptor.iterations) {
+        const branch = materializeLocator(page, iteration);
+        if (await targetLocatorForScrollAndGlass.and(branch).count()) {
+          humanReadable = iteration.humanReadable;
+          break;
+        }
+        if (!isCurrent()) return cancelled;
+      }
+    }
+    if (!isCurrent()) return cancelled;
 
     const result: HighlightLocatorResult = {
       count,
@@ -1104,7 +1280,8 @@ export class BrowserManager extends EventEmitter {
       elements,
       statusText,
       expressionText: meta?.expressionText || descriptor.humanReadable,
-      humanReadable: descriptor.humanReadable,
+      humanReadable,
+      combinedHumanReadable: descriptor.iterations ? descriptor.humanReadable : undefined,
       strippedActionMethod: meta?.strippedActionMethod,
       activeElementIndex: resolvedFocusIndex,
       parameterInfo: meta?.parameterInfo,
@@ -1129,6 +1306,9 @@ export class BrowserManager extends EventEmitter {
     return {
       isRunning: Boolean(this.browser && this.page && !this.page.isClosed?.()),
       currentUrl: this.currentUrl,
+      pageReady: this.isPageReady(),
+      navigationLoading: Boolean(this.explicitNavigation || this.pendingNavigationRequest),
+      navigationError: this.navigationError,
       pageTitle: this.pageTitle,
       viewport: { ...this.viewport },
       storageStatePath: this.storageStatePath,
@@ -1139,7 +1319,21 @@ export class BrowserManager extends EventEmitter {
     };
   }
 
-  public async dispose(): Promise<void> {
+  public dispose(): Promise<void> {
+    this.closing ??= this.closeBrowser().finally(() => { this.closing = undefined; });
+    return this.closing;
+  }
+
+  private async closeBrowser(): Promise<void> {
+    this.pageReady = false;
+    this.pendingNavigationRequest = undefined;
+    this.currentUrl = 'about:blank';
+    this.navigationError = undefined;
+    this.explicitNavigation = undefined;
+    this.pageTitle = '';
+    this.lastHighlight = undefined;
+    this.lastDescriptor = undefined;
+    this.lastMeta = undefined;
     this.searchEpoch += 1;
     this.cancelScheduledRehighlight();
     await this.stopScreencast();

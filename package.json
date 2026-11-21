@@ -2,7 +2,7 @@
   "name": "pw-locator-inspector",
   "displayName": "Playwright Locator Inspector",
   "description": "Embedded VS Code browser and live Playwright locator highlighting from code (Page Objects, helpers, and tests)",
-  "version": "0.8.5",
+  "version": "0.9.8",
   "author": "Rudoi S.",
   "publisher": "RudoySergeyA",
   "icon": "assets/icon.png",
@@ -17,6 +17,12 @@
   },
   "engines": {
     "vscode": "^1.85.0"
+  },
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "Playwright Locator Inspector executes Playwright from workspace node_modules and reads local project files, so it requires a trusted workspace."
+    }
   },
   "categories": [
     "Testing",
@@ -33,7 +39,7 @@
       {
         "command": "pwLocatorInspector.openBrowser",
         "title": "Playwright: Open Browser Inspector",
-        "icon": "$(globe)"
+        "icon": "$(inspect)"
       },
       {
         "command": "pwLocatorInspector.showLocator",
@@ -68,11 +74,6 @@
     "configuration": {
       "title": "Playwright Locator Inspector",
       "properties": {
-        "pwLocatorInspector.defaultUrl": {
-          "type": "string",
-          "default": "",
-          "description": "Default URL when opening the embedded browser (falls back to baseURL from playwright.config)"
-        },
         "pwLocatorInspector.viewportWidth": {
           "type": "number",
           "default": 1440,
@@ -87,6 +88,11 @@
           "type": "string",
           "default": "",
           "description": "Relative or absolute path to a Playwright storageState (.json) file for authenticated sessions"
+        },
+        "pwLocatorInspector.readEnvFiles": {
+          "type": "boolean",
+          "default": false,
+          "description": "Allow reading non-sensitive URL/config variables (e.g. BASE_URL, QA_URL) from workspace .env files. Sensitive keys (tokens, passwords, secrets, auth, keys) are always excluded."
         }
       }
     }
