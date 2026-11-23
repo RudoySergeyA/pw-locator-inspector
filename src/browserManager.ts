@@ -1306,11 +1306,7 @@ export class BrowserManager extends EventEmitter {
 
     if (!isCurrent()) return cancelled;
     const visibleCount = elements.filter((e) => e.visible).length;
-    const strippedNote = meta?.strippedActionMethod
-      ? ` [action .${meta.strippedActionMethod}() stripped]`
-      : '';
-
-    const statusText = `Found: ${count} (visible: ${visibleCount})${strippedNote}`;
+    const statusText = `Found: ${count} (visible: ${visibleCount})`;
     let humanReadable = descriptor.humanReadable;
     if (resolvedFocusIndex !== null && descriptor.iterations?.length) {
       // DOM-порядок объединения не обязан совпадать с порядком итераций.

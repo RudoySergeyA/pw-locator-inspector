@@ -364,11 +364,12 @@ async function verifySearchErrorClearsHighlight() {
     await commands.get('pwLocatorInspector.showLocator')();
     postedMessages.length = 0;
     clearCalls.length = 0;
+    shownErrors.length = 0;
     await receiveMessage({ type: 'searchLocatorSnippet', snippet: 'ааыаываыва ыа ываыа ыва' });
     assert.deepEqual(clearCalls, [true]);
-    assert.ok(shownErrors.some((m) => m.includes('Failed to parse or resolve Playwright locator')));
+    assert.equal(shownErrors.length, 0);
     const stateIdx = postedMessages.findIndex((m) => m.type === 'state' && m.payload?.lastHighlight === undefined);
-    const errIdx = postedMessages.findIndex((m) => m.type === 'searchError');
+    const errIdx = postedMessages.findIndex((m) => m.type === 'searchError' && m.payload?.message === 'Not found');
     assert.ok(stateIdx !== -1 && errIdx !== -1 && stateIdx < errIdx);
   } finally {
     BrowserManager.prototype.ensureStarted = origEnsureStarted;
@@ -380,6 +381,16 @@ async function verifySearchErrorClearsHighlight() {
   }
 }
 await verifySearchErrorClearsHighlight();
+
+const webviewHtml = BrowserWebviewPanel.buildWebviewHtml();
+assert.ok(!webviewHtml.includes("locatorSearchInput.addEventListener('paste'"));
+assert.ok(!webviewHtml.includes('locatorSearchInput.value = cleaned;'));
+assert.ok(webviewHtml.includes('id="btn-clear-highlight" disabled'));
+assert.ok(webviewHtml.includes('id="btn-search-locator" disabled'));
+assert.ok(webviewHtml.includes('#locator-status.badge'));
+assert.ok(webviewHtml.includes('font-size: 16px;\n      font-weight: 600;'.replace('\n', '\n')));
+assert.ok(webviewHtml.includes('height: 36px;'));
+assert.ok(webviewHtml.includes('hl.strippedActionMethod'));
 
 async function verifySelectionBadge(filePath, url) {
   const lines = ['page.locator(\'meta[name="description"]\')', 'page.getByRole("button", { name: "Mobile menu" })'];
@@ -867,7 +878,8 @@ export class DemoPage {
       strippedActionMethod: resolvedSave.strippedActionMethod,
     });
     assert.equal(hlSave.count, 1);
-    assert.equal(hlSave.statusText, 'Found: 1 (visible: 1) [action .click() stripped]');
+    assert.equal(hlSave.statusText, 'Found: 1 (visible: 1)');
+    assert.equal(hlSave.strippedActionMethod, 'click');
     assert.equal(await page.locator('x-pw-inspector-banner').count(), 0);
     assert.equal(await page.locator('x-pw-glass').count(), 0);
     assert.deepEqual(await page.locator('x-pw-inspector-badge').allTextContents(), ['1']);
@@ -1050,9 +1062,9 @@ export class DemoPage {
     const chainLongBox = await webviewPage.locator('#locator-chain').boundingBox();
     assert.ok(
       await webviewPage.locator('#locator-chain').evaluate((el) => el.scrollWidth > el.clientWidth && el.classList.contains('has-horizontal-scroll')),
-      'Длинная цепочка Playwright должна включать расширенный режим при горизонтальном скролле'
+      'Длинная цепочка Playwright должна включать горизонтальный скролл'
     );
-    assert.ok(chainLongBox.height > chainEmptyHeight, 'Поле Playwright должно увеличиваться по высоте при горизонтальном скролле');
+    assert.equal(chainLongBox.height, chainEmptyHeight, 'Высота поля Playwright не должна прыгать при появлении скролла');
     const paramHighlight = {
       ...hlSave,
       humanReadable: 'page.getByText("0-4")',
@@ -1093,11 +1105,16 @@ export class DemoPage {
     );
     const details = webviewPage.locator('#inspector-details');
     const detailsBefore = await details.boundingBox();
+    const rawMultiline = 'page\n  .getByTestId("save-btn")';
+    await webviewPage.locator('#locator-search-input').fill(rawMultiline);
+    await webviewPage.getByRole('button', { name: 'Find', exact: true }).click();
+    assert.equal(await webviewPage.locator('#locator-search-input').inputValue(), rawMultiline);
+    assert.ok(await webviewPage.evaluate(() => window.__msgs.some((m) => m.type === 'searchLocatorSnippet' && m.snippet === 'page.getByTestId("save-btn")')));
     await webviewPage.locator('#locator-search-input').fill('invalid locator');
     await webviewPage.evaluate(() => {
-      window.postMessage({ type: 'searchError', payload: { message: 'Failed to parse locator' } }, '*');
+      window.postMessage({ type: 'searchError', payload: { message: 'Not found' } }, '*');
     });
-    assert.equal(await webviewPage.locator('#locator-status').textContent(), 'Failed to parse locator');
+    assert.equal(await webviewPage.locator('#locator-status').textContent(), 'Not found');
     assert.equal(await webviewPage.locator('#locator-chain').textContent(), '');
     assert.equal(await webviewPage.locator('#elements-value').textContent(), '');
     assert.equal(await webviewPage.locator('#param-value').textContent(), '');

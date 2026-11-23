@@ -59,6 +59,7 @@ export class BrowserWebviewPanel {
       storageStatePath?: string;
       viewport?: { width: number; height: number };
       readEnvFiles?: boolean;
+      preserveFocus?: boolean;
       onSearchLocatorSnippet?: SearchLocatorSnippetHandler;
       onSelectParameterVariant?: SelectParameterVariantHandler;
       onClearHighlight?: ClearHighlightHandler;
@@ -77,10 +78,10 @@ export class BrowserWebviewPanel {
         BrowserWebviewPanel.currentInstance.onClearHighlight =
           options.onClearHighlight;
       }
-      if (!BrowserWebviewPanel.currentInstance.panel.visible) {
+      if (!BrowserWebviewPanel.currentInstance.panel.visible || options?.preserveFocus === false) {
         BrowserWebviewPanel.currentInstance.panel.reveal(
           BrowserWebviewPanel.currentInstance.panel.viewColumn,
-          true
+          options?.preserveFocus ?? true
         );
       }
       await browserManager.ensureStarted(options);
@@ -93,7 +94,7 @@ export class BrowserWebviewPanel {
     const panel = vscode.window.createWebviewPanel(
       BrowserWebviewPanel.viewType,
       'Playwright Browser Inspector',
-      { viewColumn: vscode.ViewColumn.Two, preserveFocus: true },
+      { viewColumn: vscode.ViewColumn.Two, preserveFocus: options?.preserveFocus ?? true },
       {
         enableScripts: true,
         retainContextWhenHidden: true,
@@ -434,9 +435,13 @@ export class BrowserWebviewPanel {
       white-space: nowrap;
       transition: border-color 0.15s, background 0.15s;
     }
-    .btn:hover {
+    .btn:enabled:hover {
       border-color: var(--accent);
       background: var(--btn-hover-bg);
+    }
+    .btn:disabled {
+      opacity: 0.42;
+      cursor: default;
     }
     body {
       --primary-border: rgba(56, 189, 248, 0.45);
@@ -450,7 +455,7 @@ export class BrowserWebviewPanel {
       border-color: var(--primary-border);
       color: var(--accent-link);
     }
-    .btn-primary:hover {
+    .btn-primary:enabled:hover {
       background: rgba(56, 189, 248, 0.24);
       border-color: var(--accent);
     }
@@ -459,7 +464,7 @@ export class BrowserWebviewPanel {
       border-color: rgba(239, 68, 68, 0.4);
       color: #fca5a5;
     }
-    .btn-clear:hover {
+    .btn-clear:enabled:hover {
       background: rgba(239, 68, 68, 0.22);
       border-color: #f87171;
     }
@@ -506,16 +511,9 @@ export class BrowserWebviewPanel {
     .locator-search-input::placeholder {
       color: var(--input-placeholder);
     }
-    .nav-group.is-new:has(.url-input:placeholder-shown) {
-      background: color-mix(in srgb, var(--card-bg) 96%, var(--accent));
-      border-color: color-mix(in srgb, var(--border) 65%, var(--accent));
-    }
-    .nav-group.is-new .url-input:placeholder-shown {
-      background: color-mix(in srgb, var(--input-bg) 94%, var(--accent));
-      border-color: color-mix(in srgb, var(--border-light) 55%, var(--accent));
-    }
     .nav-group .url-input:focus {
-      border-color: var(--accent);
+      border-color: var(--primary-border);
+      box-shadow: inset 0 0 0 1px var(--primary-border);
     }
     .navigation-error {
       color: var(--vscode-errorForeground, #f87171);
@@ -650,7 +648,8 @@ export class BrowserWebviewPanel {
       box-shadow: inset 0 0 0 1px var(--primary-border);
     }
     .select-box:focus-visible {
-      border-color: var(--accent);
+      border-color: var(--primary-border);
+      box-shadow: inset 0 0 0 1px var(--primary-border);
     }
     #elements-select:disabled,
     #param-select:disabled {
@@ -728,7 +727,8 @@ export class BrowserWebviewPanel {
       overflow-y: hidden;
     }
     .locator-search-input:focus {
-      border-color: var(--accent);
+      border-color: var(--primary-border);
+      box-shadow: inset 0 0 0 1px var(--primary-border);
     }
     .badge {
       padding: 2px 9px;
@@ -739,6 +739,15 @@ export class BrowserWebviewPanel {
       overflow: hidden;
       text-overflow: ellipsis;
       max-width: 100%;
+    }
+    #locator-status.badge {
+      display: inline-block;
+      width: 156px;
+      max-width: 100%;
+      height: 22px;
+      line-height: 16px;
+      text-align: center;
+      flex: 0 1 156px;
     }
     .badge-idle {
       background: rgba(148, 163, 184, 0.14);
@@ -824,16 +833,17 @@ export class BrowserWebviewPanel {
       scrollbar-width: thin;
     }
     .code-line.pw-chain {
-      min-height: 24px;
-      line-height: 24px;
+      height: 36px;
+      min-height: 36px;
+      max-height: 36px;
+      padding: 5px 9px 0 9px;
+      line-height: 18px;
+      background: var(--card-bg);
+      border: 1px solid var(--border-light);
+      border-radius: 6px;
+      overflow-x: auto;
       overflow-y: hidden;
       color: var(--code-pw);
-    }
-    .code-line.pw-chain.has-horizontal-scroll {
-      min-height: 34px;
-      line-height: 1.5;
-      padding-top: 2px;
-      padding-bottom: 12px;
     }
 
     .param-toolbar,
@@ -901,8 +911,10 @@ export class BrowserWebviewPanel {
       border: 1px solid var(--border);
     }
     .empty-placeholder {
-      color: var(--muted);
-      font-size: 13px;
+      color: var(--text);
+      opacity: 0.8;
+      font-size: 16px;
+      font-weight: 600;
       text-align: center;
       padding: 24px;
       margin: auto;
@@ -969,8 +981,8 @@ export class BrowserWebviewPanel {
         <span id="locator-status" class="badge badge-idle" role="status">Waiting for page</span>
       </div>
       <div class="inspector-actions-area">
-        <button class="btn btn-clear btn-action" id="btn-clear-highlight" style="display: none;" title="Remove highlight overlay from the page and clear search results">Clear</button>
-        <button class="btn btn-primary btn-action" id="btn-search-locator" title="Find and highlight locator on the current page (Enter)">Find</button>
+        <button class="btn btn-clear btn-action" id="btn-clear-highlight" disabled title="Remove highlight overlay from the page and clear search results">Clear</button>
+        <button class="btn btn-primary btn-action" id="btn-search-locator" disabled title="Find and highlight locator on the current page (Enter)">Find</button>
       </div>
     </div>
 
@@ -1057,6 +1069,7 @@ export class BrowserWebviewPanel {
     let navigationWasPending = false;
     let navigationLoading = false;
     let resettingUrl = false;
+    let hasFocusedUrlOnInit = false;
 
     function cleanAndCompactCode(rawText) {
       if (!rawText) return '';
@@ -1110,10 +1123,16 @@ export class BrowserWebviewPanel {
       syncLocatorChainLayout();
     });
 
+    function updateInspectorActionButtons() {
+      const enabled = pageReady && locatorSearchInput.value.length > 0;
+      btnClearHighlight.disabled = !enabled;
+      btnSearchLocator.disabled = !enabled;
+    }
+
     function resetInspectorPanel(clearSearchField = false) {
       locatorStatus.textContent = pageReady ? 'Waiting for locator' : 'Waiting for page';
+      locatorStatus.title = '';
       locatorStatus.className = 'badge badge-idle';
-      btnClearHighlight.style.display = 'none';
       locatorChain.textContent = '';
       syncLocatorChainLayout();
       renderParameterBar(null);
@@ -1122,18 +1141,21 @@ export class BrowserWebviewPanel {
         locatorSearchInput.value = '';
         autoResizeLocatorInput();
       }
+      updateInspectorActionButtons();
     }
 
     function triggerLocatorSearch() {
+      if (!pageReady) {
+        return;
+      }
       const cleaned = cleanAndCompactCode(locatorSearchInput.value);
       if (!cleaned) {
         return;
       }
-      locatorSearchInput.value = cleaned;
-      autoResizeLocatorInput();
-      locatorStatus.textContent = pageReady ? 'Searching...' : 'Waiting for page';
+      locatorStatus.textContent = 'Searching...';
+      locatorStatus.title = '';
       locatorStatus.className = 'badge badge-idle';
-      btnClearHighlight.style.display = 'inline-flex';
+      updateInspectorActionButtons();
       vscode.postMessage({
         type: 'searchLocatorSnippet',
         snippet: cleaned,
@@ -1141,30 +1163,9 @@ export class BrowserWebviewPanel {
     }
 
     btnSearchLocator.addEventListener('click', triggerLocatorSearch);
-    locatorSearchInput.addEventListener('paste', (e) => {
-      const pasted = (e.clipboardData || window.clipboardData).getData('text');
-      if (pasted) {
-        e.preventDefault();
-        const cleaned = cleanAndCompactCode(pasted);
-        const start = locatorSearchInput.selectionStart || 0;
-        const end = locatorSearchInput.selectionEnd || 0;
-        const current = locatorSearchInput.value;
-        const isFullLocatorPaste =
-          /^(page\.|this\.|const\b|let\b|var\b|await\b|expect\s*\(|\.locator\b|locator\s*\(|getBy[A-Z])/.test(
-            cleaned
-          ) ||
-          (start === 0 && end === 0 && current.trim().length > 0);
-        const nextVal = isFullLocatorPaste
-          ? cleaned
-          : cleanAndCompactCode(
-              current.slice(0, start) + cleaned + current.slice(end)
-            );
-        locatorSearchInput.value = nextVal;
-        autoResizeLocatorInput();
-      }
-    });
     locatorSearchInput.addEventListener('input', () => {
       autoResizeLocatorInput();
+      updateInspectorActionButtons();
     });
     locatorSearchInput.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' && !e.shiftKey) {
@@ -1564,8 +1565,11 @@ export class BrowserWebviewPanel {
         return;
       }
       locatorStatus.textContent = hl.statusText;
+      locatorStatus.title = hl.strippedActionMethod
+        ? hl.statusText + ' [action .' + hl.strippedActionMethod + '() stripped]'
+        : hl.statusText;
       locatorStatus.className = 'badge ' + (hl.count > 0 ? 'badge-ok' : 'badge-zero');
-      btnClearHighlight.style.display = 'inline-flex';
+      updateInspectorActionButtons();
       locatorChain.textContent = hl.humanReadable;
       syncLocatorChainLayout();
       autoResizeLocatorInput();
@@ -1631,6 +1635,11 @@ export class BrowserWebviewPanel {
         urlInput.value = currentUrl;
       }
       updateScreen();
+      updateInspectorActionButtons();
+      if (!hasFocusedUrlOnInit && !currentUrl && !navigationLoading) {
+        hasFocusedUrlOnInit = true;
+        urlInput.focus();
+      }
     }
 
     window.addEventListener('message', (event) => {
@@ -1679,16 +1688,19 @@ export class BrowserWebviewPanel {
         const text = cleanAndCompactCode((msg.payload && msg.payload.expressionText) || '');
         locatorSearchInput.value = text;
         autoResizeLocatorInput();
+        updateInspectorActionButtons();
       } else if (msg.type === 'searchError') {
         if (!pageReady) return;
-        const errText = (msg.payload && msg.payload.message) || 'Failed to parse locator';
         resetInspectorPanel(false);
-        locatorStatus.textContent = errText;
+        locatorStatus.textContent = 'Not found';
+        locatorStatus.title = '';
         locatorStatus.className = 'badge badge-zero';
-        btnClearHighlight.style.display = 'inline-flex';
+        updateInspectorActionButtons();
       }
     });
 
+    updateInspectorActionButtons();
+    urlInput.focus();
     vscode.postMessage({ type: 'ready' });
   </script>
 </body>

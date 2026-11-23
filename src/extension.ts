@@ -785,11 +785,9 @@ export function activate(context: vscode.ExtensionContext): void {
       );
 
       if (!targetDescriptor) {
-        const warnMsg = 'Failed to build locator descriptor.';
         currentParameterizedSession = undefined;
         await browserManager.clearHighlight(true);
-        panel.postSearchError(warnMsg);
-        vscode.window.showWarningMessage(warnMsg);
+        panel.postSearchError('Not found');
         return;
       }
 
@@ -806,12 +804,10 @@ export function activate(context: vscode.ExtensionContext): void {
         `Playwright Inspector: ${highlightRes.statusText}`,
         5000
       );
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+    } catch {
       currentParameterizedSession = undefined;
       await browserManager.clearHighlight(true);
-      panel.postSearchError(msg);
-      vscode.window.showErrorMessage(`Playwright Locator Inspector: ${msg}`);
+      panel.postSearchError('Not found');
     }
   };
 
@@ -825,7 +821,7 @@ export function activate(context: vscode.ExtensionContext): void {
         await BrowserWebviewPanel.createOrShow(
           context,
           browserManager,
-          getWorkspaceOptions()
+          { ...getWorkspaceOptions(), preserveFocus: false }
         );
         scheduleGutterScan(200);
       } catch (err) {
