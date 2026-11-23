@@ -69,8 +69,11 @@ const {
   isSensitiveHeaderName,
   sanitizeBaseUrl,
   resolveLocatorAtPosition,
+  resolveLocatorAtPositionWithCounts,
   resolveLocatorFromSnippet,
   collectFileLocators,
+  collectFileLocatorsWithCounts,
+  MissingLoopCountError,
   materializeLocator,
   BrowserManager,
   BrowserWebviewPanel,
@@ -104,6 +107,126 @@ assert.deepEqual(loopDescriptor?.iterations?.map(({ steps }) => steps.slice(-2).
 assert.deepEqual(resolveLocatorAtPosition({
   filePath: loopFilePath, sourceText: loopSource, line: 7, column: 16,
 }).descriptor, loopDescriptor);
+
+const countLoopSource = [
+  'class ConstructorComponent {',
+  '  readonly page: Page;',
+  '  readonly dishes: { root: Locator; cards: Locator };',
+  '  constructor(page: Page) {',
+  '    this.page = page;',
+  '    this.dishes = {',
+  '      root: this.page.getByTestId("dishes"),',
+  '      cards: this.page.getByTestId("dishes").locator(".card"),',
+  '    };',
+  '  }',
+  '  async assertDishesElementsVisible(flag: boolean) {',
+  '    const dishesCardCount = await this.dishes.cards.count();',
+  '    if (flag) {',
+  '      for (let i = 0; i < dishesCardCount; i++) {',
+  '        const card = this.dishes.cards.nth(i);',
+  '        const dishImage = card.locator("img");',
+  '        if ((await dishImage.count()) > 0) {',
+  '          await expect(dishImage).toBeVisible();',
+  '        }',
+  '      }',
+  '    }',
+  '    for (let j = 0; j < Math.min(await this.dishes.cards.count(), 2); j++) {',
+  '      const shortCard = this.dishes.cards.nth(j);',
+  '    }',
+  '    for (let k = dishesCardCount - 1; k >= 0; k--) {',
+  '      const revCard = this.dishes.cards.nth(k);',
+  '    }',
+  '  }',
+  '}',
+].join('\n');
+const countLoopFilePath = path.join(extensionRoot, 'ConstructorComponent.ts');
+assert.throws(
+  () => resolveLocatorAtPosition({ filePath: countLoopFilePath, sourceText: countLoopSource, line: 15, column: 15 }),
+  (err) => err instanceof MissingLoopCountError &&
+    err.countDescriptors.length === 1 &&
+    err.countDescriptors[0].humanReadable === 'page.getByTestId("dishes").locator(".card")'
+);
+let countProbeCalls = 0;
+const resolvedCardInLoop = await resolveLocatorAtPositionWithCounts({
+  filePath: countLoopFilePath,
+  sourceText: countLoopSource,
+  line: 15,
+  column: 15,
+  resolveCount: async (desc) => {
+    countProbeCalls += 1;
+    return desc.humanReadable === 'page.getByTestId("dishes").locator(".card")' ? 3 : undefined;
+  },
+});
+assert.equal(countProbeCalls, 1);
+assert.deepEqual(
+  resolvedCardInLoop.descriptor?.iterations?.map((d) => d.humanReadable),
+  [
+    'page.getByTestId("dishes").locator(".card").nth(0)',
+    'page.getByTestId("dishes").locator(".card").nth(1)',
+    'page.getByTestId("dishes").locator(".card").nth(2)',
+  ]
+);
+const resolvedDishImage = await resolveLocatorAtPositionWithCounts({
+  filePath: countLoopFilePath,
+  sourceText: countLoopSource,
+  line: 16,
+  column: 15,
+  resolveCount: async () => 3,
+});
+assert.deepEqual(
+  resolvedDishImage.descriptor?.iterations?.map((d) => d.humanReadable),
+  [
+    'page.getByTestId("dishes").locator(".card").nth(0).locator("img")',
+    'page.getByTestId("dishes").locator(".card").nth(1).locator("img")',
+    'page.getByTestId("dishes").locator(".card").nth(2).locator("img")',
+  ]
+);
+const collectedCountLoop = await collectFileLocatorsWithCounts({
+  filePath: countLoopFilePath,
+  sourceText: countLoopSource,
+  resolveCount: async () => 3,
+});
+assert.ok(collectedCountLoop.some((item) => item.line === 15 && item.descriptor?.iterations?.length === 3));
+assert.ok(collectedCountLoop.some((item) => item.line === 16 && item.descriptor?.iterations?.length === 3));
+assert.ok(collectedCountLoop.some((item) => item.line === 18 && item.descriptor?.iterations?.length === 3));
+assert.ok(collectedCountLoop.some((item) => item.line === 23 && item.descriptor?.iterations?.length === 2));
+assert.deepEqual(
+  collectedCountLoop.find((item) => item.line === 26)?.descriptor?.iterations?.map((d) => d.steps.at(-1)?.args),
+  [[2], [1], [0]]
+);
+
+const nestedCountSource = [
+  'async function checkTable(page: Page) {',
+  '  const rows = page.locator("tr");',
+  '  const rowCount = await rows.count();',
+  '  for (let i = 0; i < rowCount; i++) {',
+  '    const cellCount = await rows.nth(i).locator("td").count();',
+  '    for (let j = 0; j < cellCount; j++) {',
+  '      const cell = rows.nth(i).locator("td").nth(j);',
+  '    }',
+  '  }',
+  '}',
+].join('\n');
+const resolvedNestedCell = await resolveLocatorAtPositionWithCounts({
+  filePath: path.join(extensionRoot, 'table.spec.ts'),
+  sourceText: nestedCountSource,
+  line: 7,
+  column: 13,
+  resolveCount: async (desc) => {
+    if (desc.humanReadable === 'page.locator("tr")') return 2;
+    if (desc.humanReadable === 'page.locator("tr").nth(0).locator("td")') return 2;
+    if (desc.humanReadable === 'page.locator("tr").nth(1).locator("td")') return 1;
+    return undefined;
+  },
+});
+assert.deepEqual(
+  resolvedNestedCell.descriptor?.iterations?.map((d) => d.humanReadable),
+  [
+    'page.locator("tr").nth(0).locator("td").nth(0)',
+    'page.locator("tr").nth(0).locator("td").nth(1)',
+    'page.locator("tr").nth(1).locator("td").nth(0)',
+  ]
+);
 
 const nullishSource = [
   'const REVIEWS_CONSTANT = { defaultTitle: "Отзывы клиентов" };',
@@ -163,6 +286,100 @@ assert.deepEqual(
     ['B2bReviewComponent', 'page.getByTestId("b2b-reviews").getByRole("heading", { level: 2 })'],
   ]
 );
+
+async function verifySearchErrorClearsHighlight() {
+  const noopEvent = () => ({ dispose() {} });
+  const commands = new Map();
+  const subscriptions = [];
+  const postedMessages = [];
+  const shownErrors = [];
+  let receiveMessage;
+  let closePanel;
+  const line = 'page.getByTestId("ok")';
+  const editor = {
+    document: {
+      uri: { scheme: 'file', fsPath: path.join(extensionRoot, 'searchError.spec.ts'), toString: () => 'searchError.spec.ts' },
+      getText: () => line,
+      lineCount: 1,
+      lineAt: () => ({ range: { end: { line: 0, character: line.length } } }),
+    },
+    selection: { start: { line: 0, character: 0 }, end: { line: 0, character: line.length }, active: { line: 0, character: 0 }, isEmpty: false },
+    setDecorations() {},
+  };
+  const savedVscode = {
+    DecorationRangeBehavior: vscodeMock.DecorationRangeBehavior,
+    ColorThemeKind: vscodeMock.ColorThemeKind,
+    Disposable: vscodeMock.Disposable,
+    workspace: vscodeMock.workspace,
+    window: vscodeMock.window,
+    commands: vscodeMock.commands,
+  };
+  Object.assign(vscodeMock, {
+    DecorationRangeBehavior: { ClosedClosed: 0 },
+    ColorThemeKind: { Light: 1, HighContrastLight: 4 },
+    Disposable: class { constructor(dispose) { this.dispose = dispose; } },
+    workspace: {
+      onDidChangeTextDocument: noopEvent,
+      getWorkspaceFolder: () => ({ uri: editor.document.uri }),
+      getConfiguration: () => ({ get: () => undefined }),
+    },
+    window: {
+      activeTextEditor: editor,
+      visibleTextEditors: [editor],
+      activeColorTheme: { kind: 1 },
+      onDidChangeActiveTextEditor: noopEvent,
+      onDidChangeTextEditorSelection: noopEvent,
+      createTextEditorDecorationType: noopEvent,
+      createWebviewPanel: () => ({
+        visible: true,
+        webview: {
+          onDidReceiveMessage(listener) { receiveMessage = listener; },
+          postMessage(message) { postedMessages.push(message); },
+        },
+        onDidDispose(listener) { closePanel = listener; },
+      }),
+      setStatusBarMessage() {},
+      showWarningMessage() {},
+      showErrorMessage(message) { shownErrors.push(message); },
+    },
+    commands: {
+      registerCommand: (id, command) => { commands.set(id, command); return noopEvent(); },
+    },
+  });
+  const origEnsureStarted = BrowserManager.prototype.ensureStarted;
+  const origClear = BrowserManager.prototype.clearHighlight;
+  const clearCalls = [];
+  BrowserManager.prototype.ensureStarted = async function () {};
+  BrowserManager.prototype.clearHighlight = async function (resetState = false) {
+    clearCalls.push(resetState);
+    return origClear.call(this, resetState);
+  };
+  try {
+    activate({
+      subscriptions,
+      workspaceState: { get: (_k, d) => d, update: async () => {} },
+      extensionPath: path.join(extensionRoot, 'tmp-ext'),
+      extension: { id: 'inspector.test' },
+    });
+    await commands.get('pwLocatorInspector.showLocator')();
+    postedMessages.length = 0;
+    clearCalls.length = 0;
+    await receiveMessage({ type: 'searchLocatorSnippet', snippet: 'ааыаываыва ыа ываыа ыва' });
+    assert.deepEqual(clearCalls, [true]);
+    assert.ok(shownErrors.some((m) => m.includes('Failed to parse or resolve Playwright locator')));
+    const stateIdx = postedMessages.findIndex((m) => m.type === 'state' && m.payload?.lastHighlight === undefined);
+    const errIdx = postedMessages.findIndex((m) => m.type === 'searchError');
+    assert.ok(stateIdx !== -1 && errIdx !== -1 && stateIdx < errIdx);
+  } finally {
+    BrowserManager.prototype.ensureStarted = origEnsureStarted;
+    BrowserManager.prototype.clearHighlight = origClear;
+    subscriptions.forEach((s) => s.dispose());
+    await deactivate();
+    closePanel?.();
+    Object.assign(vscodeMock, savedVscode);
+  }
+}
+await verifySearchErrorClearsHighlight();
 
 async function verifySelectionBadge(filePath, url) {
   const lines = ['page.locator(\'meta[name="description"]\')', 'page.getByRole("button", { name: "Mobile menu" })'];
@@ -876,6 +1093,17 @@ export class DemoPage {
     );
     const details = webviewPage.locator('#inspector-details');
     const detailsBefore = await details.boundingBox();
+    await webviewPage.locator('#locator-search-input').fill('invalid locator');
+    await webviewPage.evaluate(() => {
+      window.postMessage({ type: 'searchError', payload: { message: 'Failed to parse locator' } }, '*');
+    });
+    assert.equal(await webviewPage.locator('#locator-status').textContent(), 'Failed to parse locator');
+    assert.equal(await webviewPage.locator('#locator-chain').textContent(), '');
+    assert.equal(await webviewPage.locator('#elements-value').textContent(), '');
+    assert.equal(await webviewPage.locator('#param-value').textContent(), '');
+    assert.ok(await paramButton.isDisabled());
+    assert.ok(await elementsButton.isDisabled());
+    assert.equal(await webviewPage.locator('#locator-search-input').inputValue(), 'invalid locator');
     await webviewPage.locator('#btn-clear-highlight').click();
     assert.equal(await webviewPage.locator('#locator-chain').textContent(), '');
     assert.equal(await webviewPage.locator('#elements-value').textContent(), '');

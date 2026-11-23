@@ -3,10 +3,11 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { BrowserManager, HighlightParameterInfo } from './browserManager';
 import {
-  collectFileLocators,
+  collectFileLocatorsWithCounts,
   LocatorDescriptor,
+  MissingLoopCountError,
   ResolvedLocatorResult,
-  resolveLocatorAtPosition,
+  resolveLocatorAtPositionWithCounts,
   resolveLocatorFromSnippet,
   SerializedArg,
   StaticForResolutionError,
@@ -300,9 +301,18 @@ export function activate(context: vscode.ExtensionContext): void {
       const doc = editor.document;
       let collected;
       try {
-        collected = collectFileLocators({
+        const scanLoopCounts = new Map<string, number>();
+        collected = await collectFileLocatorsWithCounts({
           filePath: doc.uri.fsPath,
           sourceText: doc.getText(),
+          loopCounts: scanLoopCounts,
+          resolveCount: async (descriptor) => {
+            if (epoch !== gutterScanEpoch || !BrowserWebviewPanel.isOpen() || !browserManager) {
+              return undefined;
+            }
+            const probe = await browserManager.probeLocatorCount(descriptor);
+            return probe.browserReady ? probe.count : undefined;
+          },
         });
       } catch {
         clearGutterDecorationsInEditor(editor);
@@ -542,7 +552,7 @@ export function activate(context: vscode.ExtensionContext): void {
     baseResolved: ResolvedLocatorResult;
     reResolveWithOverrides: (
       overrides: Record<string, SerializedArg>
-    ) => ResolvedLocatorResult;
+    ) => Promise<ResolvedLocatorResult> | ResolvedLocatorResult;
   }
 
   let currentParameterizedSession: ParameterizedSession | undefined;
@@ -552,7 +562,7 @@ export function activate(context: vscode.ExtensionContext): void {
     resolved: ResolvedLocatorResult,
     reResolveWithOverrides: (
       overrides: Record<string, SerializedArg>
-    ) => ResolvedLocatorResult,
+    ) => Promise<ResolvedLocatorResult> | ResolvedLocatorResult,
     filePath?: string
   ): Promise<{
     descriptor?: LocatorDescriptor;
@@ -627,7 +637,7 @@ export function activate(context: vscode.ExtensionContext): void {
       defaultOverrides[pName] = '';
     }
     try {
-      const fallbackResolved = reResolveWithOverrides(defaultOverrides);
+      const fallbackResolved = await reResolveWithOverrides(defaultOverrides);
       return {
         descriptor: fallbackResolved.descriptor,
         expressionLabel: resolved.expressionText,
@@ -776,6 +786,8 @@ export function activate(context: vscode.ExtensionContext): void {
 
       if (!targetDescriptor) {
         const warnMsg = 'Failed to build locator descriptor.';
+        currentParameterizedSession = undefined;
+        await browserManager.clearHighlight(true);
         panel.postSearchError(warnMsg);
         vscode.window.showWarningMessage(warnMsg);
         return;
@@ -796,6 +808,8 @@ export function activate(context: vscode.ExtensionContext): void {
       );
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      currentParameterizedSession = undefined;
+      await browserManager.clearHighlight(true);
       panel.postSearchError(msg);
       vscode.window.showErrorMessage(`Playwright Locator Inspector: ${msg}`);
     }
@@ -823,12 +837,23 @@ export function activate(context: vscode.ExtensionContext): void {
     }
   );
 
-  const resolveSelectionOrPosition = (
+  const resolveLoopCountFromBrowser = async (
+    descriptor: LocatorDescriptor
+  ): Promise<number | undefined> => {
+    if (!browserManager?.isPageReady()) {
+      return undefined;
+    }
+    const probe = await browserManager.probeLocatorCount(descriptor);
+    return probe.browserReady ? probe.count : undefined;
+  };
+
+  const resolveSelectionOrPosition = async (
     doc: vscode.TextDocument,
     pos: vscode.Position,
     sel?: vscode.Selection,
-    parameterOverrides?: Record<string, SerializedArg>
-  ): ResolvedLocatorResult => {
+    parameterOverrides?: Record<string, SerializedArg>,
+    loopCounts?: Map<string, number>
+  ): Promise<ResolvedLocatorResult> => {
     const hasSelection = Boolean(sel && !sel.isEmpty);
     if (hasSelection && sel) {
       const selection = {
@@ -837,17 +862,19 @@ export function activate(context: vscode.ExtensionContext): void {
         endLine: sel.end.line + 1,
         endColumn: sel.end.character + 1,
       };
-      const resolveInFile = () => resolveLocatorAtPosition({
+      const resolveInFile = () => resolveLocatorAtPositionWithCounts({
         filePath: doc.uri.fsPath,
         sourceText: doc.getText(),
         line: pos.line + 1,
         column: pos.character + 1,
         selection,
         parameterOverrides,
+        loopCounts,
+        resolveCount: resolveLoopCountFromBrowser,
       });
       let positional: ResolvedLocatorResult | undefined;
       try {
-        positional = resolveInFile();
+        positional = await resolveInFile();
         if (positional.descriptor?.iterations) return positional;
       } catch (err) {
         if (err instanceof StaticForResolutionError) throw err;
@@ -887,12 +914,14 @@ export function activate(context: vscode.ExtensionContext): void {
       return positional ?? resolveInFile();
     }
 
-    return resolveLocatorAtPosition({
+    return resolveLocatorAtPositionWithCounts({
       filePath: doc.uri.fsPath,
       sourceText: doc.getText(),
       line: pos.line + 1,
       column: pos.character + 1,
       parameterOverrides,
+      loopCounts,
+      resolveCount: resolveLoopCountFromBrowser,
     });
   };
 
@@ -908,7 +937,14 @@ export function activate(context: vscode.ExtensionContext): void {
       captureEditorContext(editor);
       const doc = editor.document;
 
-      const resolved = resolveSelectionOrPosition(doc, pos, sel);
+      const loopCounts = new Map<string, number>();
+      const resolved = await resolveSelectionOrPosition(
+        doc,
+        pos,
+        sel,
+        undefined,
+        loopCounts
+      );
 
       const {
         descriptor: targetDescriptor,
@@ -916,7 +952,8 @@ export function activate(context: vscode.ExtensionContext): void {
         parameterInfo,
       } = await buildInitialHighlightPayload(
         resolved,
-        (overrides) => resolveSelectionOrPosition(doc, pos, sel, overrides),
+        (overrides) =>
+          resolveSelectionOrPosition(doc, pos, sel, overrides, loopCounts),
         doc.uri.fsPath
       );
 
@@ -1041,7 +1078,7 @@ export function activate(context: vscode.ExtensionContext): void {
           return;
         }
         try {
-          const resolved = resolveSelectionOrPosition(
+          const resolved = await resolveSelectionOrPosition(
             editor.document,
             sel.active,
             sel
@@ -1194,8 +1231,17 @@ export function activate(context: vscode.ExtensionContext): void {
               'zero'
             );
           }
-        } catch {
+        } catch (err) {
           if (seq === selectionProbeSeq) {
+            if (!BrowserWebviewPanel.isOpen() && err instanceof MissingLoopCountError) {
+              setHoverInlineBadge(
+                editor.document.uri,
+                sel.end.line,
+                'Inspector browser is closed',
+                'idle'
+              );
+              return;
+            }
             editor.setDecorations(hoverInlineBadgeDecorationType, []);
           }
         }

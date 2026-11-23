@@ -56,6 +56,17 @@ export interface LocatorDescriptor {
 
 export class StaticForResolutionError extends Error {}
 
+export class MissingLoopCountError extends StaticForResolutionError {
+  public readonly countDescriptors: LocatorDescriptor[];
+
+  constructor(countDescriptors: LocatorDescriptor[]) {
+    super(
+      'Cannot resolve loop bound from .count() until a page is loaded in the Inspector browser.'
+    );
+    this.countDescriptors = countDescriptors;
+  }
+}
+
 const MAX_STATIC_FOR_ITERATIONS = 100;
 const MISSING_LOOP_VALUE = 'static for: missing value';
 class LoopEvaluation extends Set<string> {}
@@ -84,6 +95,8 @@ export interface ResolveLocatorOptions {
   };
   /** Значения параметров для параметризованных методов/хелперов */
   parameterOverrides?: Record<string, SerializedArg>;
+  /** Известные значения `.count()` для динамических циклов (ключ — humanReadable дескриптора) */
+  loopCounts?: ReadonlyMap<string, number> | Record<string, number>;
 }
 
 export interface ResolveLocatorSnippetOptions {
@@ -446,6 +459,80 @@ function unwrapParensAndTypes(node: ts.Node): ts.Node {
     cur = cur.expression;
   }
   return cur;
+}
+
+function normalizeLoopCounts(
+  input?: ReadonlyMap<string, number> | Record<string, number>
+): ReadonlyMap<string, number> | undefined {
+  if (!input) {
+    return undefined;
+  }
+  if (input instanceof Map) {
+    return input;
+  }
+  if (typeof (input as ReadonlyMap<string, number>).get === 'function') {
+    return input as ReadonlyMap<string, number>;
+  }
+  return new Map<string, number>(
+    Object.entries(input).filter(
+      (entry): entry is [string, number] => typeof entry[1] === 'number'
+    )
+  );
+}
+
+function extractCountTargetNode(rawNode: ts.Node): ts.Expression | undefined {
+  const node = unwrapParensAndTypes(rawNode);
+  if (!ts.isCallExpression(node) || node.arguments.length !== 0) {
+    return undefined;
+  }
+  const callee = unwrapParensAndTypes(node.expression);
+  if (ts.isPropertyAccessExpression(callee) && callee.name.text === 'count') {
+    return callee.expression;
+  }
+  return undefined;
+}
+
+function isVariableReassignedBetween(
+  statements: readonly ts.Statement[],
+  afterStmt: ts.Statement,
+  beforeStmt: ts.Statement,
+  varName: string
+): boolean {
+  const startIdx = statements.indexOf(afterStmt);
+  const endIdx = statements.indexOf(beforeStmt);
+  if (startIdx === -1 || endIdx === -1 || endIdx <= startIdx + 1) {
+    return false;
+  }
+  const hasMutation = (n: ts.Node): boolean => {
+    if (ts.isFunctionLike(n)) {
+      return false;
+    }
+    if (
+      (ts.isPrefixUnaryExpression(n) || ts.isPostfixUnaryExpression(n)) &&
+      (n.operator === ts.SyntaxKind.PlusPlusToken ||
+        n.operator === ts.SyntaxKind.MinusMinusToken) &&
+      ts.isIdentifier(n.operand) &&
+      n.operand.text === varName
+    ) {
+      return true;
+    }
+    if (
+      ts.isBinaryExpression(n) &&
+      n.operatorToken.kind >= ts.SyntaxKind.FirstAssignment &&
+      n.operatorToken.kind <= ts.SyntaxKind.LastAssignment &&
+      ts.isIdentifier(n.left) &&
+      n.left.text === varName
+    ) {
+      return true;
+    }
+    return ts.forEachChild(n, hasMutation) === true;
+  };
+  for (let idx = startIdx + 1; idx < endIdx; idx++) {
+    if (hasMutation(statements[idx])) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /**
@@ -1553,8 +1640,20 @@ class FileLocatorAnalyzer {
           node: stmt,
           env: cloneEnv(this.rootEnv),
         });
+        if (stmt.body) {
+          const fnEnv = createEnv(this.rootEnv);
+          for (const param of stmt.parameters) {
+            if (ts.isIdentifier(param.name) && param.name.text === 'page') {
+              fnEnv.vars.set('page', { kind: 'page' });
+            }
+          }
+          this.nodeEnvs.set(stmt, fnEnv);
+          this.scanMethodForCallsAndVars(stmt.body, fnEnv);
+        }
       } else if (ts.isClassDeclaration(stmt)) {
         this.analyzeClassDeclaration(stmt);
+      } else if (ts.isExpressionStatement(stmt)) {
+        this.scanMethodForCallsAndVars(stmt, createEnv(this.rootEnv));
       }
     }
   }
@@ -1713,21 +1812,22 @@ class FileLocatorAnalyzer {
   private scanMethodForCallsAndVars(
     node: ts.Node,
     env: ScopeEnv,
-    instance: AstValue & { kind: 'classInstance' }
+    instance?: AstValue & { kind: 'classInstance' }
   ): void {
-    this.nodeEnvs.set(node, env);
+    const activeEnv = ts.isFunctionLike(node) ? createEnv(env) : env;
+    this.nodeEnvs.set(node, activeEnv);
 
     if (ts.isVariableStatement(node)) {
       for (const decl of node.declarationList.declarations) {
         if (ts.isIdentifier(decl.name) && decl.initializer) {
-          const val = this.evaluateNode(decl.initializer, env, new Set(), decl.name.text);
+          const val = this.evaluateNode(decl.initializer, activeEnv, new Set(), decl.name.text);
           if (val) {
-            env.vars.set(decl.name.text, val);
+            activeEnv.vars.set(decl.name.text, val);
           }
         }
       }
     } else if (ts.isForOfStatement(node)) {
-      const iterableVal = this.evaluateNode(node.expression, env, new Set());
+      const iterableVal = this.evaluateNode(node.expression, activeEnv, new Set());
       if (
         iterableVal?.kind === 'array' &&
         ts.isVariableDeclarationList(node.initializer) &&
@@ -1737,14 +1837,14 @@ class FileLocatorAnalyzer {
         if (ts.isIdentifier(loopVarDecl.name)) {
           const loopVarName = loopVarDecl.name.text;
           for (const itemVal of iterableVal.elements) {
-            const iterEnv = createEnv(env);
+            const iterEnv = createEnv(activeEnv);
             iterEnv.vars.set(loopVarName, itemVal);
             this.scanMethodForCallsAndVars(node.statement, iterEnv, instance);
           }
           return;
         }
       }
-    } else if (ts.isCallExpression(node)) {
+    } else if (ts.isCallExpression(node) && instance) {
       // Проверяем вызов this.<method>(...)
       const callee = unwrapParensAndTypes(node.expression);
       if (
@@ -1757,14 +1857,14 @@ class FileLocatorAnalyzer {
           this.recordMethodOrFunctionCall(
             methodDecl,
             node.arguments,
-            env,
+            activeEnv,
             `this.${methodName}`
           );
         }
       }
     }
 
-    ts.forEachChild(node, (child) => this.scanMethodForCallsAndVars(child, env, instance));
+    ts.forEachChild(node, (child) => this.scanMethodForCallsAndVars(child, activeEnv, instance));
   }
 
   private recordMethodOrFunctionCall(
@@ -2344,7 +2444,11 @@ class FileLocatorAnalyzer {
     return cloneEnv(this.rootEnv);
   }
 
-  public resolveForLocator(node: ts.Node, overrides?: Record<string, SerializedArg>): LocatorDescriptor | undefined {
+  public resolveForLocator(
+    node: ts.Node,
+    overrides?: Record<string, SerializedArg>,
+    loopCountsInput?: ReadonlyMap<string, number> | Record<string, number>
+  ): LocatorDescriptor | undefined {
     if (ts.isIdentifier(node) && ts.isVariableDeclaration(node.parent) && node.parent.name === node && node.parent.initializer) {
       node = node.parent.initializer;
     }
@@ -2358,29 +2462,214 @@ class FileLocatorAnalyzer {
     }
     if (!outerLoop) return undefined;
 
-    const outerIndex = pathToNode.indexOf(outerLoop);
+    const loopCounts = normalizeLoopCounts(loopCountsInput);
     const scope = this.findScopeForNode(outerLoop);
     for (const [name, value] of Object.entries(overrides ?? {})) {
       scope.vars.set(name, serializedArgToAstValue(value));
     }
+
+    const blockDeclExprs = new WeakMap<
+      ScopeEnv,
+      Map<string, { expr: ts.Expression; env: ScopeEnv }>
+    >();
+    const lookupDeclExpr = (
+      env: ScopeEnv,
+      varName: string
+    ): { expr: ts.Expression; env: ScopeEnv } | undefined => {
+      let cur: ScopeEnv | undefined = env;
+      while (cur) {
+        const map = blockDeclExprs.get(cur);
+        if (map?.has(varName)) {
+          return map.get(varName);
+        }
+        cur = cur.parent;
+      }
+      return undefined;
+    };
+
+    const evaluateLoopNumeric = (
+      rawExpr: ts.Expression | undefined,
+      env: ScopeEnv,
+      missingCounts: Map<string, LocatorDescriptor>,
+      visitedVars: Set<string> = new Set()
+    ): number | undefined => {
+      if (!rawExpr) {
+        return undefined;
+      }
+      const expr = unwrapParensAndTypes(rawExpr) as ts.Expression;
+      const countTarget = extractCountTargetNode(expr);
+      if (countTarget) {
+        const unresolved = new LoopEvaluation();
+        const targetVal = this.evaluateNode(countTarget, env, unresolved);
+        if (unresolved.size || targetVal?.kind !== 'locator') {
+          return undefined;
+        }
+        const key = targetVal.descriptor.humanReadable;
+        if (loopCounts?.has(key)) {
+          return loopCounts.get(key);
+        }
+        if (!missingCounts.has(key)) {
+          missingCounts.set(key, targetVal.descriptor);
+        }
+        return undefined;
+      }
+
+      if (ts.isNumericLiteral(expr)) {
+        const n = Number(expr.text);
+        return Number.isSafeInteger(n) ? n : undefined;
+      }
+      if (ts.isPrefixUnaryExpression(expr)) {
+        const val = evaluateLoopNumeric(expr.operand, env, missingCounts, visitedVars);
+        if (val === undefined) {
+          return undefined;
+        }
+        if (expr.operator === ts.SyntaxKind.MinusToken) {
+          return -val;
+        }
+        if (expr.operator === ts.SyntaxKind.PlusToken) {
+          return val;
+        }
+        return undefined;
+      }
+      if (ts.isBinaryExpression(expr)) {
+        const op = expr.operatorToken.kind;
+        if (
+          op === ts.SyntaxKind.PlusToken ||
+          op === ts.SyntaxKind.MinusToken ||
+          op === ts.SyntaxKind.AsteriskToken
+        ) {
+          const left = evaluateLoopNumeric(expr.left, env, missingCounts, visitedVars);
+          const right = evaluateLoopNumeric(expr.right, env, missingCounts, visitedVars);
+          if (left === undefined || right === undefined) {
+            return undefined;
+          }
+          const res =
+            op === ts.SyntaxKind.PlusToken
+              ? left + right
+              : op === ts.SyntaxKind.MinusToken
+                ? left - right
+                : left * right;
+          return Number.isSafeInteger(res) ? res : undefined;
+        }
+      }
+      if (
+        ts.isCallExpression(expr) &&
+        ts.isPropertyAccessExpression(expr.expression) &&
+        ts.isIdentifier(expr.expression.expression) &&
+        expr.expression.expression.text === 'Math' &&
+        (expr.expression.name.text === 'min' || expr.expression.name.text === 'max') &&
+        expr.arguments.length > 0
+      ) {
+        const argVals: number[] = [];
+        for (const arg of expr.arguments) {
+          const v = evaluateLoopNumeric(arg, env, missingCounts, visitedVars);
+          if (v === undefined) {
+            return undefined;
+          }
+          argVals.push(v);
+        }
+        return expr.expression.name.text === 'min'
+          ? Math.min(...argVals)
+          : Math.max(...argVals);
+      }
+      if (ts.isIdentifier(expr)) {
+        const direct = lookupEnv(env, expr.text);
+        if (
+          direct?.kind === 'primitive' &&
+          typeof direct.value === 'number' &&
+          Number.isSafeInteger(direct.value)
+        ) {
+          return direct.value;
+        }
+        if (!visitedVars.has(expr.text)) {
+          const declEntry = lookupDeclExpr(env, expr.text);
+          if (declEntry) {
+            const nextVisited = new Set(visitedVars);
+            nextVisited.add(expr.text);
+            return evaluateLoopNumeric(
+              declEntry.expr,
+              declEntry.env,
+              missingCounts,
+              nextVisited
+            );
+          }
+        }
+      }
+
+      const unresolved = new LoopEvaluation();
+      const val = this.evaluateNode(expr, env, unresolved);
+      if (
+        !unresolved.size &&
+        val?.kind === 'primitive' &&
+        typeof val.value === 'number' &&
+        Number.isSafeInteger(val.value)
+      ) {
+        return val.value;
+      }
+      return undefined;
+    };
+
     let scopes = [scope];
     let remaining = MAX_STATIC_FOR_ITERATIONS;
-    for (let p = Math.max(0, outerIndex - 1); p < pathToNode.length - 1; p++) {
+    for (let p = 0; p < pathToNode.length - 1; p++) {
       const parent = pathToNode[p];
       const child = pathToNode[p + 1];
-      if (ts.isBlock(parent)) {
+      if (ts.isBlock(parent) || ts.isSourceFile(parent)) {
         scopes = scopes.map((env) => {
           const block = createEnv(env);
+          const declExprs = new Map<string, { expr: ts.Expression; env: ScopeEnv }>();
+          blockDeclExprs.set(block, declExprs);
           for (const stmt of parent.statements) {
             if (stmt === child) break;
             if (!ts.isVariableStatement(stmt)) continue;
+            const isConst = Boolean(stmt.declarationList.flags & ts.NodeFlags.Const);
             for (const decl of stmt.declarationList.declarations) {
               if (!ts.isIdentifier(decl.name)) continue;
+              const varName = decl.name.text;
+              if (overrides && Object.prototype.hasOwnProperty.call(overrides, varName)) {
+                continue;
+              }
+              const canTrack =
+                Boolean(decl.initializer) &&
+                (isConst ||
+                  !isVariableReassignedBetween(
+                    parent.statements,
+                    stmt,
+                    child as ts.Statement,
+                    varName
+                  ));
+              if (canTrack && decl.initializer) {
+                declExprs.set(varName, { expr: decl.initializer, env: block });
+                if (loopCounts) {
+                  const tempMissing = new Map<string, LocatorDescriptor>();
+                  const numVal = evaluateLoopNumeric(
+                    decl.initializer,
+                    block,
+                    tempMissing
+                  );
+                  if (numVal !== undefined && tempMissing.size === 0) {
+                    block.vars.set(varName, { kind: 'primitive', value: numVal });
+                    continue;
+                  }
+                }
+                if (extractCountTargetNode(decl.initializer)) {
+                  block.vars.set(varName, {
+                    kind: 'unresolvedParam',
+                    paramName: varName,
+                  });
+                  continue;
+                }
+              }
               const unresolved = new LoopEvaluation();
-              const value = stmt.declarationList.flags & ts.NodeFlags.Const
+              const value = isConst && decl.initializer
                 ? this.evaluateNode(decl.initializer, block, unresolved)
                 : undefined;
-              block.vars.set(decl.name.text, value && !unresolved.size ? value : { kind: 'unresolvedParam', paramName: decl.name.text });
+              block.vars.set(
+                varName,
+                value && !unresolved.size
+                  ? value
+                  : { kind: 'unresolvedParam', paramName: varName }
+              );
             }
           }
           return block;
@@ -2391,7 +2680,7 @@ class FileLocatorAnalyzer {
         const condition = parent.condition;
         const update = parent.incrementor;
         const invalid = () => new StaticForResolutionError('Cannot statically resolve the for loop. Expected an integer counter with a known bound and ++ or --.');
-        if (!decl || !ts.isIdentifier(decl.name) || !condition || !ts.isBinaryExpression(condition) ||
+        if (!decl || !decl.initializer || !ts.isIdentifier(decl.name) || !condition || !ts.isBinaryExpression(condition) ||
             !ts.isIdentifier(condition.left) || condition.left.text !== decl.name.text ||
             !update || !(ts.isPrefixUnaryExpression(update) || ts.isPostfixUnaryExpression(update)) ||
             !ts.isIdentifier(update.operand) || update.operand.text !== decl.name.text) throw invalid();
@@ -2411,23 +2700,36 @@ class FileLocatorAnalyzer {
           return ts.forEachChild(n, unsafeBody) === true;
         };
         if (unsafeBody(parent.statement)) throw invalid();
-        scopes = scopes.flatMap((env) => {
-          const unresolved = new LoopEvaluation();
-          const start = this.evaluateNode(decl.initializer, env, unresolved);
-          const end = this.evaluateNode(condition.right, env, unresolved);
-          if (unresolved.size || start?.kind !== 'primitive' || typeof start.value !== 'number' || !Number.isSafeInteger(start.value) ||
-              end?.kind !== 'primitive' || typeof end.value !== 'number' || !Number.isSafeInteger(end.value)) throw invalid();
+        const missingCounts = new Map<string, LocatorDescriptor>();
+        const nextScopes: ScopeEnv[] = [];
+        for (const env of scopes) {
+          const start = evaluateLoopNumeric(decl.initializer, env, missingCounts);
+          const end = evaluateLoopNumeric(condition.right, env, missingCounts);
+          if (missingCounts.size > 0) {
+            continue;
+          }
+          if (
+            start === undefined ||
+            !Number.isSafeInteger(start) ||
+            end === undefined ||
+            !Number.isSafeInteger(end)
+          ) {
+            throw invalid();
+          }
           const inclusive = op === ts.SyntaxKind.LessThanEqualsToken || op === ts.SyntaxKind.GreaterThanEqualsToken;
-          const length = Math.max(0, (end.value - start.value) * delta + Number(inclusive));
+          const length = Math.max(0, (end - start) * delta + Number(inclusive));
           if (length > remaining) throw new StaticForResolutionError(`Static for loop exceeds ${MAX_STATIC_FOR_ITERATIONS} iterations.`);
           remaining -= length;
-          const startValue = start.value;
-          return Array.from({ length }, (_, i) => {
+          for (let i = 0; i < length; i++) {
             const iteration = createEnv(env);
-            iteration.vars.set(name, { kind: 'primitive', value: startValue + i * delta });
-            return iteration;
-          });
-        });
+            iteration.vars.set(name, { kind: 'primitive', value: start + i * delta });
+            nextScopes.push(iteration);
+          }
+        }
+        if (missingCounts.size > 0) {
+          throw new MissingLoopCountError(Array.from(missingCounts.values()));
+        }
+        scopes = nextScopes;
       }
     }
     if (!scopes.length) throw new StaticForResolutionError('The for loop has no iterations.');
@@ -2890,7 +3192,8 @@ export function resolveLocatorAtPosition(
     chosen,
     analyzer,
     sf,
-    options.parameterOverrides
+    options.parameterOverrides,
+    options.loopCounts
   );
 }
 
@@ -3226,7 +3529,8 @@ function buildResultFromCandidate(
   candidate: CandidateLocatorNode,
   analyzer: FileLocatorAnalyzer,
   sf: ts.SourceFile,
-  parameterOverrides?: Record<string, SerializedArg>
+  parameterOverrides?: Record<string, SerializedArg>,
+  loopCounts?: ReadonlyMap<string, number> | Record<string, number>
 ): ResolvedLocatorResult {
   const startPos = sf.getLineAndCharacterOfPosition(
     candidate.hitRangeNode.getStart(sf)
@@ -3247,7 +3551,11 @@ function buildResultFromCandidate(
       .replace(/\s+/g, ' ')
       .trim();
 
-  const loopDescriptor = analyzer.resolveForLocator(candidate.locatorExprNode, parameterOverrides);
+  const loopDescriptor = analyzer.resolveForLocator(
+    candidate.locatorExprNode,
+    parameterOverrides,
+    loopCounts
+  );
   if (loopDescriptor) {
     return {
       expressionText, range, activeLineRanges,
@@ -4267,6 +4575,8 @@ export interface CollectedFileLocator {
 export function collectFileLocators(options: {
   filePath: string;
   sourceText?: string;
+  loopCounts?: ReadonlyMap<string, number> | Record<string, number>;
+  missingLoopCounts?: LocatorDescriptor[];
 }): CollectedFileLocator[] {
   const filePath = path.resolve(options.filePath);
   const sourceText =
@@ -4441,12 +4751,19 @@ export function collectFileLocators(options: {
   visit(sf);
 
   const byLine = new Map<number, CollectedFileLocator>();
+  const seenMissing = new Set<string>();
   for (const cand of candidates) {
     if (hasParseErrorInNode(cand.hitRangeNode)) {
       continue;
     }
     try {
-      const resolved = buildResultFromCandidate(cand, analyzer, sf);
+      const resolved = buildResultFromCandidate(
+        cand,
+        analyzer,
+        sf,
+        undefined,
+        options.loopCounts
+      );
       const line = resolved.range.startLine;
       if (byLine.has(line)) {
         continue;
@@ -4469,10 +4786,110 @@ export function collectFileLocators(options: {
         variantKind: resolved.variantKind,
         variants: resolved.variants,
       });
-    } catch {
+    } catch (err) {
+      if (err instanceof MissingLoopCountError && options.missingLoopCounts) {
+        for (const desc of err.countDescriptors) {
+          if (!seenMissing.has(desc.humanReadable)) {
+            seenMissing.add(desc.humanReadable);
+            options.missingLoopCounts.push(desc);
+          }
+        }
+      }
       // Игнорируем невычислимые/недописанные узлы при живом редактировании
     }
   }
 
   return Array.from(byLine.values()).sort((a, b) => a.line - b.line);
+}
+
+export type LoopCountResolver = (
+  descriptor: LocatorDescriptor
+) => Promise<number | undefined>;
+
+export async function resolveLocatorAtPositionWithCounts(
+  options: ResolveLocatorOptions & {
+    resolveCount: LoopCountResolver;
+    maxCountRounds?: number;
+  }
+): Promise<ResolvedLocatorResult> {
+  const loopCounts = new Map<string, number>(
+    normalizeLoopCounts(options.loopCounts)?.entries() ?? []
+  );
+  const maxRounds = options.maxCountRounds ?? 10;
+  for (let round = 0; round < maxRounds; round++) {
+    try {
+      return resolveLocatorAtPosition({
+        ...options,
+        loopCounts,
+      });
+    } catch (err) {
+      if (!(err instanceof MissingLoopCountError)) {
+        throw err;
+      }
+      let resolvedAny = false;
+      for (const desc of err.countDescriptors) {
+        if (loopCounts.has(desc.humanReadable)) {
+          continue;
+        }
+        const count = await options.resolveCount(desc);
+        if (count === undefined) {
+          throw err;
+        }
+        loopCounts.set(desc.humanReadable, count);
+        resolvedAny = true;
+      }
+      if (!resolvedAny) {
+        throw err;
+      }
+    }
+  }
+  return resolveLocatorAtPosition({
+    ...options,
+    loopCounts,
+  });
+}
+
+export async function collectFileLocatorsWithCounts(options: {
+  filePath: string;
+  sourceText?: string;
+  resolveCount: LoopCountResolver;
+  loopCounts?: ReadonlyMap<string, number> | Record<string, number>;
+  maxCountRounds?: number;
+}): Promise<CollectedFileLocator[]> {
+  const loopCounts = new Map<string, number>(
+    normalizeLoopCounts(options.loopCounts)?.entries() ?? []
+  );
+  const maxRounds = options.maxCountRounds ?? 10;
+  for (let round = 0; round < maxRounds; round++) {
+    const missingLoopCounts: LocatorDescriptor[] = [];
+    const collected = collectFileLocators({
+      filePath: options.filePath,
+      sourceText: options.sourceText,
+      loopCounts,
+      missingLoopCounts,
+    });
+    if (missingLoopCounts.length === 0) {
+      return collected;
+    }
+    let resolvedAny = false;
+    for (const desc of missingLoopCounts) {
+      if (loopCounts.has(desc.humanReadable)) {
+        continue;
+      }
+      const count = await options.resolveCount(desc);
+      if (count === undefined) {
+        continue;
+      }
+      loopCounts.set(desc.humanReadable, count);
+      resolvedAny = true;
+    }
+    if (!resolvedAny) {
+      return collected;
+    }
+  }
+  return collectFileLocators({
+    filePath: options.filePath,
+    sourceText: options.sourceText,
+    loopCounts,
+  });
 }

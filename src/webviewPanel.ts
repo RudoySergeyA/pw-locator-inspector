@@ -1682,6 +1682,7 @@ export class BrowserWebviewPanel {
       } else if (msg.type === 'searchError') {
         if (!pageReady) return;
         const errText = (msg.payload && msg.payload.message) || 'Failed to parse locator';
+        resetInspectorPanel(false);
         locatorStatus.textContent = errText;
         locatorStatus.className = 'badge badge-zero';
         btnClearHighlight.style.display = 'inline-flex';
