@@ -359,6 +359,23 @@ const server = http.createServer((req, res) => {
     res.end(`<!doctype html><html><body><main><h1>Other Page</h1></main></body></html>`);
     return;
   }
+  if (req.url === '/nuxt-startup' || req.url === '/nuxt-startup?marker-only') {
+    const mountId = req.url.endsWith('?marker-only') ? 'custom-nuxt-root' : '__nuxt';
+    res.end(`<!doctype html><div id="${mountId}"><div style="height: 2400px"></div>
+      <h2 data-testid="save-btn">Target below the fold</h2></div>
+      <script type="application/json" data-nuxt-data>[]</script>
+      <script>
+        history.scrollRestoration = 'manual';
+        const app = { isHydrating: true };
+        const root = document.getElementById('__nuxt');
+        if (root) root.__vue_app__ = { config: { globalProperties: { $nuxt: app } } };
+        window.finishStartup = () => {
+          window.scrollTo({ top: 0, behavior: 'instant' });
+          app.isHydrating = false;
+        };
+      </script>`);
+    return;
+  }
   res.end(`<!doctype html><html><head><meta name="description" content="Demo Page"><style>@media (min-width: 600px) { #mobile-menu { display: none; } }</style></head><body>
     ${req.url?.includes('toggle=1') ? '<script>setTimeout(() => { const b = document.createElement("button"); b.id = "mobile-menu"; b.textContent = "Mobile menu"; document.body.append(b); setTimeout(() => b.remove(), 1150); }, 850);</script>' : '<button id="mobile-menu">Mobile menu</button>'}
     <a href="/other">Other page</a>
@@ -659,10 +676,36 @@ export class DemoPage {
     await page.getByRole('img', { name: 'Beta' }).evaluate((image) => image.remove());
     assert.equal((await bm.highlightLocator(loopDescriptor)).count, 2);
     assert.match((await bm.focusHighlightedElement(1)).humanReadable, /\.nth\(2\)/);
+    const waitForScrollTarget = () => page.waitForFunction(() => {
+      const { top, bottom } = document.querySelector('h2').getBoundingClientRect();
+      return top >= 0 && bottom <= innerHeight;
+    }, undefined, { timeout: 5000 });
+    await bm.navigate(`${baseUrl}/nuxt-startup`);
+    for (const reloading of [false, true]) {
+      if (reloading) {
+        const highlighted = once(bm, 'highlightChanged', { signal: AbortSignal.timeout(5000) });
+        await bm.reload();
+        const [result] = await highlighted;
+        assert.equal(result.count, 1);
+      } else {
+        assert.equal((await bm.highlightLocator(resolvedSave.descriptor)).count, 1);
+      }
+      assert.ok(await page.getByRole('heading', { name: 'Target below the fold' }).evaluate(
+        (el) => el.getBoundingClientRect().top > innerHeight
+      ), 'Nuxt still owns the viewport while hydrating');
+      await page.evaluate(() => window.finishStartup());
+      await waitForScrollTarget();
+    }
+    await bm.navigate(`${baseUrl}/nuxt-startup?marker-only`);
+    assert.equal((await bm.highlightLocator(resolvedSave.descriptor)).count, 1);
+    await waitForScrollTarget();
+    console.log('✓ Locator scroll follows Nuxt startup and reload');
+
     await bm.clearHighlight(true);
     await bm.reload();
     assert.equal(bm.getStateSnapshot().lastHighlight, undefined);
     assert.equal(await page.locator('x-pw-inspector-overlay').count(), 0);
+    await bm.navigate(baseUrl);
 
     // Задерживаем поиск после его запуска, чтобы Clear отработал первым.
     const originalClear = bm.clearHighlight.bind(bm);
@@ -746,9 +789,10 @@ export class DemoPage {
     await webviewPage.getByRole('button', { name: 'Viewport' }).press('ArrowDown');
     await webviewPage.getByRole('listbox', { name: 'Viewport' }).getByRole('option', { name: /Mobile/ }).click();
     assert.ok(await webviewPage.evaluate(() => window.__msgs.some((m) => m.type === 'setViewport' && m.width === 393)));
+    const longChain = 'page.getByTestId("main-root").getByTestId("profile-card").getByRole("button", { name: "Save" })';
     await webviewPage.evaluate(({ highlight, url }) => {
       window.postMessage({ type: 'state', payload: { pageReady: true, currentUrl: url, lastHighlight: highlight } }, '*');
-    }, { highlight: { ...hlSave, count: 2, visibleCount: 2, elements: [hlSave.elements[0], { ...hlSave.elements[0], index: 1 }] }, url: baseUrl });
+    }, { highlight: { ...hlSave, humanReadable: longChain, count: 2, visibleCount: 2, elements: [hlSave.elements[0], { ...hlSave.elements[0], index: 1 }] }, url: baseUrl });
     const elementsButton = webviewPage.getByRole('button', { name: 'Elements' });
     await webviewPage.locator('#elements-select:enabled').waitFor();
     const browserPreview = webviewPage.locator('#viewport-host');
@@ -772,7 +816,7 @@ export class DemoPage {
       arrows.map((arrow) => getComputedStyle(arrow).fontSize));
     assert.equal(new Set(arrowSizes).size, 1);
     assert.doesNotMatch(await options.last().textContent(), /•| \/ |\.nth\(|\.last\(/);
-    assert.equal(await options.last().getAttribute('title'), `${hlSave.humanReadable}.nth(1)`);
+    assert.equal(await options.last().getAttribute('title'), `${longChain}.nth(1)`);
     const goBorder = await webviewPage.locator('#btn-go').evaluate((el) => getComputedStyle(el).borderTopColor);
     await options.nth(1).hover();
     await webviewPage.waitForFunction((color) => {

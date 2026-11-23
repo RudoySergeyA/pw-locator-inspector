@@ -136,6 +136,13 @@ export class BrowserManager extends EventEmitter {
     parameterInfo?: HighlightParameterInfo;
   };
   private searchEpoch = 0;
+  private documentEpoch = 0;
+  private nuxtStartupScroll?: {
+    page: unknown;
+    documentEpoch: number;
+    settled: boolean;
+    done: Promise<void>;
+  };
   private domChangeTimer?: ReturnType<typeof setTimeout>;
   private navigationRehighlightTimer?: ReturnType<typeof setTimeout>;
   private navigationRetryTimer?: ReturnType<typeof setTimeout>;
@@ -407,6 +414,8 @@ export class BrowserManager extends EventEmitter {
     };
     page.on('request', (request: NavigationRequest) => {
       if (isMainNavigation(request)) {
+        this.documentEpoch += 1;
+        this.nuxtStartupScroll = undefined;
         this.pendingNavigationRequest = request;
         navigationStatus = undefined;
         this.pageReady = false;
@@ -951,6 +960,58 @@ export class BrowserManager extends EventEmitter {
     );
   }
 
+  private async getNuxtStartupScroll(page: any, documentEpoch: number) {
+    if (this.nuxtStartupScroll?.page === page && this.nuxtStartupScroll?.documentEpoch === documentEpoch) {
+      return this.nuxtStartupScroll.settled ? undefined : this.nuxtStartupScroll;
+    }
+    const isNuxt = await page.evaluate(() => Boolean(
+      document.querySelector('#__nuxt, script[data-nuxt-data]')
+    )).catch(() => false);
+    if (!isNuxt || page !== this.page || documentEpoch !== this.documentEpoch) return undefined;
+    // Another highlight may have started the wait while we detected Nuxt.
+    if (this.nuxtStartupScroll?.page === page && this.nuxtStartupScroll?.documentEpoch === documentEpoch) {
+      return this.nuxtStartupScroll.settled ? undefined : this.nuxtStartupScroll;
+    }
+
+    const done: Promise<void> = page.evaluate(() => new Promise<void>((resolve) => {
+      const started = performance.now();
+      let stableSince: number | undefined;
+      let x = window.scrollX;
+      let y = window.scrollY;
+      const check = () => {
+        const now = performance.now();
+        type VueRoot = Element & {
+          __vue_app__?: { config?: { globalProperties?: { $nuxt?: { isHydrating?: boolean } } } };
+        };
+        // Nuxt can mount to a custom root instead of #__nuxt.
+        const roots = [document.getElementById('__nuxt'), ...Array.from(document.body?.children || [])];
+        const hydrating = roots.some((root) => (root as VueRoot | null)
+          ?.__vue_app__?.config?.globalProperties?.$nuxt?.isHydrating === true);
+        const ready = document.readyState === 'complete' && !hydrating;
+        if (!ready || x !== window.scrollX || y !== window.scrollY) {
+          stableSince = undefined;
+        } else {
+          stableSince ??= now;
+        }
+        x = window.scrollX;
+        y = window.scrollY;
+        // Don't let stalled resources or an unmounted Nuxt app disable autoscroll forever.
+        if ((stableSince !== undefined && now - stableSince >= 120) || now - started >= 7000) {
+          resolve();
+        } else {
+          setTimeout(check, 32);
+        }
+      };
+      check();
+    }));
+    const startup = { page, documentEpoch, settled: false, done };
+    this.nuxtStartupScroll = startup;
+    void done.then(() => { startup.settled = true; }, () => {
+      if (this.nuxtStartupScroll === startup) this.nuxtStartupScroll = undefined;
+    });
+    return startup;
+  }
+
   /**
    * Материализует LocatorDescriptor на открытой странице, проверяет count(),
    * скроллит страницу к первому (или выбранному) элементу и рисует живую подсветку с автообновлением при скролле.
@@ -1017,40 +1078,31 @@ export class BrowserManager extends EventEmitter {
         ? targetElementIndex
         : null;
 
-    const targetLocatorForScrollAndGlass =
-      resolvedFocusIndex !== null
-        ? locator.nth(resolvedFocusIndex)
-        : locator.first();
+    const scrollTarget = resolvedFocusIndex !== null ? locator.nth(resolvedFocusIndex) : locator.first();
+    const documentEpoch = this.documentEpoch;
+    const pageUrl = page.url();
+    const canScroll = () => isCurrent() && this.isPageReady() &&
+      this.documentEpoch === documentEpoch && page.url() === pageUrl;
+    const startup = await this.getNuxtStartupScroll(page, documentEpoch);
+    if (!canScroll()) return cancelled;
 
-    // Скроллим страницу к центру экрана, чтобы элемент не прятался под fixed/sticky шапкой сайта
-    try {
-      await targetLocatorForScrollAndGlass.evaluate((el: unknown) => {
-        const domEl = el as {
-          scrollIntoView?: (opts: Record<string, string>) => void;
-          getBoundingClientRect?: () => { top: number; bottom: number };
-        };
-        const win = globalThis as unknown as {
-          scrollBy?: (x: number, y: number) => void;
-          innerHeight?: number;
-        };
-        if (typeof domEl.scrollIntoView === 'function') {
-          domEl.scrollIntoView({
-            behavior: 'instant',
-            block: 'center',
-            inline: 'nearest',
-          });
-          if (typeof win.scrollBy === 'function' && typeof domEl.getBoundingClientRect === 'function') {
-            const rect = domEl.getBoundingClientRect();
-            const vh = win.innerHeight || 900;
-            if (rect.top < 80 && rect.bottom < vh - 80) {
-              win.scrollBy(0, rect.top - 80);
-            }
+    // Center the target to keep it clear of fixed/sticky page headers.
+    const scrollToTarget = async () => {
+      if (!canScroll()) return;
+      try {
+        await scrollTarget.evaluate((el: Element) => {
+          el.scrollIntoView({ behavior: 'instant', block: 'center', inline: 'nearest' });
+          const win = el.ownerDocument.defaultView;
+          const rect = el.getBoundingClientRect();
+          if (win && rect.top < 80 && rect.bottom < win.innerHeight - 80) {
+            win.scrollBy({ top: rect.top - 80, behavior: 'instant' });
           }
-        }
-      });
-    } catch {
-      // ignore
-    }
+        }, undefined, { timeout: 500 });
+      } catch {
+        // The target may have disappeared during navigation or hydration.
+      }
+    };
+    if (!startup) await scrollToTarget();
 
     // Один оверлей: нативная подсветка добавляет вторую рамку и подпись.
     if (!isCurrent()) return cancelled;
@@ -1264,7 +1316,7 @@ export class BrowserManager extends EventEmitter {
       // DOM-порядок объединения не обязан совпадать с порядком итераций.
       for (const iteration of descriptor.iterations) {
         const branch = materializeLocator(page, iteration);
-        if (await targetLocatorForScrollAndGlass.and(branch).count()) {
+        if (await scrollTarget.and(branch).count()) {
           humanReadable = iteration.humanReadable;
           break;
         }
@@ -1289,6 +1341,7 @@ export class BrowserManager extends EventEmitter {
     this.lastHighlight = result;
     this.emit('highlightChanged', result);
     this.emit('stateChanged', this.getStateSnapshot());
+    if (startup) void startup.done.then(scrollToTarget, () => undefined);
     return result;
   }
 

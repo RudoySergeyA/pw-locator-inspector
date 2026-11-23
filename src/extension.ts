@@ -338,13 +338,20 @@ export function activate(context: vscode.ExtensionContext): void {
             item.variants.length > 0 &&
             item.variantKind === 'context'
           ) {
-            let matchedVariant = item.variants[0];
+            const preferredContextId = selectedContextByFile.get(doc.uri.fsPath);
+            const preferredVariant = preferredContextId
+              ? item.variants.find((v) => v.id === preferredContextId)
+              : undefined;
+            const variantsToProbe = preferredVariant
+              ? [preferredVariant]
+              : item.variants;
+            let matchedVariant = variantsToProbe[0];
             let matchedProbe: { browserReady: boolean; count: number; visibleCount: number } = {
               browserReady: true,
               count: 0,
               visibleCount: 0,
             };
-            for (const variant of item.variants) {
+            for (const variant of variantsToProbe) {
               if (epoch !== gutterScanEpoch || !BrowserWebviewPanel.isOpen()) {
                 return;
               }
@@ -354,7 +361,7 @@ export function activate(context: vscode.ExtensionContext): void {
               if (!probe.browserReady) {
                 return;
               }
-              if (probe.count > 0) {
+              if (preferredVariant || probe.count > 0) {
                 matchedVariant = variant;
                 matchedProbe = probe;
                 break;
@@ -373,7 +380,7 @@ export function activate(context: vscode.ExtensionContext): void {
             const decType = getGutterDecorationType(kind, label);
             const statusLine =
               matchedProbe.count === 0
-                ? '**Not found in DOM** (`0` matches)'
+                ? `**Not found in DOM** (\`0\` matches)${preferredVariant ? ` · \`${matchedVariant.label}\`` : ''}`
                 : matchedProbe.count === 1
                   ? `**Found: 1** (visible: ${matchedProbe.visibleCount}) · \`${matchedVariant.label}\``
                   : `**Found: ${matchedProbe.count}** (visible: ${matchedProbe.visibleCount}) — multiple matches · \`${matchedVariant.label}\``;
@@ -489,6 +496,8 @@ export function activate(context: vscode.ExtensionContext): void {
     hoverInlineBadgeDecorationType,
     BrowserWebviewPanel.onDidClose(() => {
       gutterScanEpoch += 1;
+      selectedContextByFile.clear();
+      currentParameterizedSession = undefined;
       if (gutterScanTimer) {
         clearTimeout(gutterScanTimer);
         gutterScanTimer = undefined;
@@ -529,6 +538,7 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   interface ParameterizedSession {
+    filePath?: string;
     baseResolved: ResolvedLocatorResult;
     reResolveWithOverrides: (
       overrides: Record<string, SerializedArg>
@@ -536,12 +546,14 @@ export function activate(context: vscode.ExtensionContext): void {
   }
 
   let currentParameterizedSession: ParameterizedSession | undefined;
+  const selectedContextByFile = new Map<string, string>();
 
   const buildInitialHighlightPayload = async (
     resolved: ResolvedLocatorResult,
     reResolveWithOverrides: (
       overrides: Record<string, SerializedArg>
-    ) => ResolvedLocatorResult
+    ) => ResolvedLocatorResult,
+    filePath?: string
   ): Promise<{
     descriptor?: LocatorDescriptor;
     expressionLabel: string;
@@ -556,12 +568,22 @@ export function activate(context: vscode.ExtensionContext): void {
     }
 
     currentParameterizedSession = {
+      filePath,
       baseResolved: resolved,
       reResolveWithOverrides,
     };
 
-    let chosenVariant = resolved.variants[0];
+    const preferredContextId =
+      resolved.variantKind === 'context' && filePath
+        ? selectedContextByFile.get(filePath)
+        : undefined;
+    const preferredVariant = preferredContextId
+      ? resolved.variants.find((v) => v.id === preferredContextId)
+      : undefined;
+
+    let chosenVariant = preferredVariant || resolved.variants[0];
     if (
+      !preferredVariant &&
       resolved.variants.length > 1 &&
       browserManager?.getStateSnapshot().pageReady
     ) {
@@ -654,6 +676,13 @@ export function activate(context: vscode.ExtensionContext): void {
         handleSearchLocatorSnippet(snippet),
       onSelectParameterVariant: (variantId: string) =>
         handleSelectParameterVariant(variantId),
+      onClearHighlight: () => {
+        currentParameterizedSession = undefined;
+        if (selectedContextByFile.size > 0) {
+          selectedContextByFile.clear();
+          scheduleGutterScan(0);
+        }
+      },
     };
   };
 
@@ -661,10 +690,20 @@ export function activate(context: vscode.ExtensionContext): void {
     if (!browserManager || !currentParameterizedSession) {
       return;
     }
-    const { baseResolved } = currentParameterizedSession;
+    const { baseResolved, filePath } = currentParameterizedSession;
     const chosen = baseResolved.variants.find((v) => v.id === variantId);
     if (!chosen) {
       return;
+    }
+    if (baseResolved.variantKind === 'context' && filePath) {
+      selectedContextByFile.set(filePath, chosen.id);
+      const targetEditor = vscode.window.visibleTextEditors.find(
+        (ed) => ed.document.uri.fsPath === filePath
+      );
+      if (targetEditor) {
+        targetEditor.setDecorations(hoverInlineBadgeDecorationType, []);
+      }
+      scheduleGutterScan(0, targetEditor);
     }
     const parameterInfo: HighlightParameterInfo = {
       baseExpressionText: baseResolved.expressionText,
@@ -722,14 +761,17 @@ export function activate(context: vscode.ExtensionContext): void {
         descriptor: targetDescriptor,
         expressionLabel: activeExpressionLabel,
         parameterInfo,
-      } = await buildInitialHighlightPayload(resolved, (overrides) =>
-        resolveLocatorFromSnippet({
-          snippet,
-          contextFilePath,
-          contextSourceText: codeCtx?.sourceText,
-          cursorLine: codeCtx?.cursorLine,
-          parameterOverrides: overrides,
-        })
+      } = await buildInitialHighlightPayload(
+        resolved,
+        (overrides) =>
+          resolveLocatorFromSnippet({
+            snippet,
+            contextFilePath,
+            contextSourceText: codeCtx?.sourceText,
+            cursorLine: codeCtx?.cursorLine,
+            parameterOverrides: overrides,
+          }),
+        contextFilePath
       );
 
       if (!targetDescriptor) {
@@ -872,8 +914,10 @@ export function activate(context: vscode.ExtensionContext): void {
         descriptor: targetDescriptor,
         expressionLabel: activeExpressionLabel,
         parameterInfo,
-      } = await buildInitialHighlightPayload(resolved, (overrides) =>
-        resolveSelectionOrPosition(doc, pos, sel, overrides)
+      } = await buildInitialHighlightPayload(
+        resolved,
+        (overrides) => resolveSelectionOrPosition(doc, pos, sel, overrides),
+        doc.uri.fsPath
       );
 
       if (!targetDescriptor) {
@@ -1034,13 +1078,22 @@ export function activate(context: vscode.ExtensionContext): void {
             resolved.variants.length > 0 &&
             resolved.variantKind === 'context'
           ) {
-            let matchedVariant = resolved.variants[0];
+            const preferredContextId = selectedContextByFile.get(
+              editor.document.uri.fsPath
+            );
+            const preferredVariant = preferredContextId
+              ? resolved.variants.find((v) => v.id === preferredContextId)
+              : undefined;
+            const variantsToProbe = preferredVariant
+              ? [preferredVariant]
+              : resolved.variants;
+            let matchedVariant = variantsToProbe[0];
             let matchedProbe: { browserReady: boolean; count: number; visibleCount: number } = {
               browserReady: true,
               count: 0,
               visibleCount: 0,
             };
-            for (const variant of resolved.variants) {
+            for (const variant of variantsToProbe) {
               const p = await browserManager.probeLocatorCount(
                 variant.descriptor
               );
@@ -1051,7 +1104,7 @@ export function activate(context: vscode.ExtensionContext): void {
                 editor.setDecorations(hoverInlineBadgeDecorationType, []);
                 return;
               }
-              if (p.count > 0) {
+              if (preferredVariant || p.count > 0) {
                 matchedVariant = variant;
                 matchedProbe = p;
                 break;
@@ -1060,7 +1113,7 @@ export function activate(context: vscode.ExtensionContext): void {
             const text =
               matchedProbe.count > 0
                 ? `Found in DOM: ${matchedProbe.count} (visible: ${matchedProbe.visibleCount}) [${matchedVariant.label}]`
-                : 'Found in DOM: 0 (not on current page)';
+                : `Found in DOM: 0${preferredVariant ? ` [${matchedVariant.label}]` : ' (not on current page)'}`;
             setHoverInlineBadge(
               editor.document.uri,
               targetLine,

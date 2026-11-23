@@ -2,7 +2,7 @@
   "name": "pw-locator-inspector",
   "displayName": "Playwright Locator Inspector",
   "description": "Embedded VS Code browser and live Playwright locator highlighting from code (Page Objects, helpers, and tests)",
-  "version": "0.9.12",
+  "version": "0.9.14",
   "author": "Rudoi S.",
   "publisher": "RudoySergeyA",
   "icon": "assets/icon.png",

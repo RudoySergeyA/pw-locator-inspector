@@ -8,6 +8,7 @@ import {
 
 export type SearchLocatorSnippetHandler = (snippet: string) => Promise<void>;
 export type SelectParameterVariantHandler = (variantId: string) => Promise<void>;
+export type ClearHighlightHandler = () => void;
 
 export class BrowserWebviewPanel {
   public static readonly viewType = 'pwLocatorInspector.browserView';
@@ -47,6 +48,7 @@ export class BrowserWebviewPanel {
   }
   private onSearchLocatorSnippet?: SearchLocatorSnippetHandler;
   private onSelectParameterVariant?: SelectParameterVariantHandler;
+  private onClearHighlight?: ClearHighlightHandler;
 
   public static async createOrShow(
     context: vscode.ExtensionContext,
@@ -59,6 +61,7 @@ export class BrowserWebviewPanel {
       readEnvFiles?: boolean;
       onSearchLocatorSnippet?: SearchLocatorSnippetHandler;
       onSelectParameterVariant?: SelectParameterVariantHandler;
+      onClearHighlight?: ClearHighlightHandler;
     }
   ): Promise<BrowserWebviewPanel> {
     if (BrowserWebviewPanel.currentInstance) {
@@ -69,6 +72,10 @@ export class BrowserWebviewPanel {
       if (options?.onSelectParameterVariant) {
         BrowserWebviewPanel.currentInstance.onSelectParameterVariant =
           options.onSelectParameterVariant;
+      }
+      if (options?.onClearHighlight) {
+        BrowserWebviewPanel.currentInstance.onClearHighlight =
+          options.onClearHighlight;
       }
       if (!BrowserWebviewPanel.currentInstance.panel.visible) {
         BrowserWebviewPanel.currentInstance.panel.reveal(
@@ -98,7 +105,8 @@ export class BrowserWebviewPanel {
       browserManager,
       context.workspaceState,
       options?.onSearchLocatorSnippet,
-      options?.onSelectParameterVariant
+      options?.onSelectParameterVariant,
+      options?.onClearHighlight
     );
 
     await browserManager.ensureStarted(options);
@@ -114,13 +122,15 @@ export class BrowserWebviewPanel {
     browserManager: BrowserManager,
     workspaceState: vscode.Memento,
     onSearchLocatorSnippet?: SearchLocatorSnippetHandler,
-    onSelectParameterVariant?: SelectParameterVariantHandler
+    onSelectParameterVariant?: SelectParameterVariantHandler,
+    onClearHighlight?: ClearHighlightHandler
   ) {
     this.panel = panel;
     this.browserManager = browserManager;
     this.workspaceState = workspaceState;
     this.onSearchLocatorSnippet = onSearchLocatorSnippet;
     this.onSelectParameterVariant = onSelectParameterVariant;
+    this.onClearHighlight = onClearHighlight;
 
     this.panel.webview.html = this.getHtmlForWebview();
 
@@ -281,6 +291,7 @@ export class BrowserWebviewPanel {
           break;
         case 'clearHighlight':
           await this.browserManager.clearHighlight(true);
+          this.onClearHighlight?.();
           break;
         case 'mouseEvent':
           await this.browserManager.handleMouseEvent(msg.event);
